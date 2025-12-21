@@ -10,12 +10,14 @@
 ### 2008.php
 这是一个来自安全天使的webshell，支持文件管理，MySQL管理，运行命令，运行PHP代码等。
 因为 chez.com 的 FTP 只有法国家宽才能连，所以在线文件管理工具是必须的。
-但是因为是在线管理，上传多个文件非常不方便，所以增加了tar.gz解压的功能。
+但是因为是在线管理，上传多个文件非常不方便，所以增加了tar.gz / zip 解压的功能。
 另外我增加了代码高亮的功能，这样编辑文件的时候舒服点。
 我是从[这里](https://github.com/tennc/webshell/blob/master/php/phpspy/2008.php)下载的，安全性未知，请自行评估使用。
 
 使用前请修改密码，免得被人猜到。
 https://github.com/benzBrake/ChezToys/blob/7194894a9ecbbab427397fb4a62d84c0c008b8f7/2008.php#L48-L53
+
+PS: zip 解压依赖 pclzip.lib.php
 
 ### phpminiadmin.php
 这个找了我一个多小时，忘记从哪里找到的，可以在线管理 MySQL 数据库，支持导入导出，当然，我也简单改了一下来兼容 chez.com 的 PHP 环境。

