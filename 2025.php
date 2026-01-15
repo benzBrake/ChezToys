@@ -546,10 +546,39 @@ if ($isAuthenticated) {
     if (isset($_POST['chunk_merge'])) {
         $fileId = stripslashes($_POST['file_id']);
         $chunkDir = $basePath . '/' . $CONFIG['CHUNK_DIR'] . '/' . $fileId;
+        $lockFile = $chunkDir . '/.merging.lock';
+
+        // 检查分片目录是否存在
+        if (!file_exists($chunkDir) || !is_dir($chunkDir)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '分片目录不存在或已被合并'));
+            exit();
+        }
+
+        // 检查是否正在合并（防止并发重复请求）
+        if (file_exists($lockFile)) {
+            // 检查锁文件是否过期（超过60秒视为异常，允许重新合并）
+            $lockTime = (int)file_get_contents($lockFile);
+            if ((time() - $lockTime) < 60) {
+                header('Content-Type: application/json');
+                echo json_encode(array('success' => false, 'error' => '正在合并中，请勿重复请求'));
+                exit();
+            }
+            // 锁文件过期，删除并继续
+            @unlink($lockFile);
+        }
+
+        // 创建锁文件
+        if (!file_put_contents($lockFile, time())) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '无法创建合并锁'));
+            exit();
+        }
 
         // 读取元数据
         $metaFile = $chunkDir . '/meta.json';
         if (!file_exists($metaFile)) {
+            @unlink($lockFile);  // 释放锁
             header('Content-Type: application/json');
             echo json_encode(array('success' => false, 'error' => '元数据不存在'));
             exit();
@@ -573,6 +602,7 @@ if ($isAuthenticated) {
         // 合并分片
         $targetHandle = fopen($targetFile, 'wb');
         if (!$targetHandle) {
+            @unlink($lockFile);  // 释放锁
             header('Content-Type: application/json');
             echo json_encode(array('success' => false, 'error' => '无法创建目标文件'));
             exit();
@@ -585,7 +615,8 @@ if ($isAuthenticated) {
                 fwrite($targetHandle, $chunkData);
             } else {
                 fclose($targetHandle);
-                unlink($targetFile);
+                @unlink($targetFile);
+                @unlink($lockFile);  // 释放锁
                 header('Content-Type: application/json');
                 echo json_encode(array('success' => false, 'error' => '分片 ' . $i . ' 缺失'));
                 exit();
@@ -593,7 +624,7 @@ if ($isAuthenticated) {
         }
         fclose($targetHandle);
 
-        // 清理临时文件
+        // 清理临时文件（包括锁文件）
         deleteDirectory($chunkDir);
 
         header('Content-Type: application/json');
@@ -3133,7 +3164,11 @@ if ($isAuthenticated) {
                                     uploadStats.textContent = `上传完成：${data.file_name}`;
                                     progressFill.style.width = '100%';
                                     setTimeout(() => {
-                                        window.location.reload();
+                                        // 清理URL参数后刷新，避免显示旧的提示信息
+                                        const url = new URL(window.location.href);
+                                        url.searchParams.delete('success');
+                                        url.searchParams.delete('error');
+                                        window.location.href = url.toString();
                                     }, 1500);
                                     resolve(data);
                                 } else {
@@ -3201,7 +3236,13 @@ if ($isAuthenticated) {
                 function processNextFile() {
                     if (processedFiles >= totalFiles) {
                         uploadStats.textContent = '上传完成！';
-                        setTimeout(() => window.location.reload(), 1000);
+                        setTimeout(() => {
+                            // 清理URL参数后刷新
+                            const url = new URL(window.location.href);
+                            url.searchParams.delete('success');
+                            url.searchParams.delete('error');
+                            window.location.href = url.toString();
+                        }, 1000);
                         return;
                     }
 
@@ -3353,7 +3394,11 @@ if ($isAuthenticated) {
 
                         // 延迟后刷新页面
                         setTimeout(() => {
-                            window.location.reload();
+                            // 清理URL参数后刷新
+                            const url = new URL(window.location.href);
+                            url.searchParams.delete('success');
+                            url.searchParams.delete('error');
+                            window.location.href = url.toString();
                         }, 1000);
                         return;
                     }
@@ -3416,7 +3461,11 @@ if ($isAuthenticated) {
 
                         // 延迟后刷新页面
                         setTimeout(() => {
-                            window.location.reload();
+                            // 清理URL参数后刷新
+                            const url = new URL(window.location.href);
+                            url.searchParams.delete('success');
+                            url.searchParams.delete('error');
+                            window.location.href = url.toString();
                         }, 1000);
                         return;
                     }
