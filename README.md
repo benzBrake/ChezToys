@@ -18,7 +18,7 @@
 https://github.com/benzBrake/ChezToys/blob/7194894a9ecbbab427397fb4a62d84c0c008b8f7/2008.php#L48-L53
 
 ### 2025.php
-这是来自免费吧网友shim的文件管理工具，不会报毒，默认密码`adminpassword2025`，支持登录后在线修改密码。
+这是来自免费吧网友shim的文件管理工具，不会报毒，默认密码`adminpassword2025`，支持登录后在线修改密码。我增加了分片上传功能。
 
 ### phpminiadmin.php
 这个找了我一个多小时，忘记从哪里找到的，可以在线管理 MySQL 数据库，支持导入导出，当然，我也简单改了一下来兼容 chez.com 的 PHP 环境。

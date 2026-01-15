@@ -1,4 +1,5 @@
 <?php
+
 /**
  * 2025.php
  * @author shim, Ryan
@@ -9,38 +10,45 @@ $CONFIG = array(
     'AUTH_COOKIE_NAME' => 'file_manager_auth', // 认证cookie名称
     'AUTH_COOKIE_EXPIRE' => 24 * 3600, // 认证cookie过期时间（24小时）
     'MAX_FILE_SIZE' => 2 * 1024 * 1024, // 最大文件大小默认值（2MB），当无法从PHP配置读取时使用
-    'ALLOWED_TYPES' => '无限制' // 允许的文件类型
+    'ALLOWED_TYPES' => '无限制', // 允许的文件类型
+    'MAX_CONCURRENT' => 3, // 最大并发数
+    // 分片上传配置
+    'CHUNK_SIZE' => 1024 * 1024, // 分片大小：1MB（保守值，确保不超过 upload_max_filesize=2M 限制，留出空间给表单开销）
+    'CHUNK_DIR' => '.chunks', // 临时分片存储目录
+    'MAX_UPLOAD_SIZE' => 2 * 1024 * 1024 * 1024 // 最大上传文件大小：2GB（防止上传过大文件）
 );
 
 // 启用输出缓冲，防止headers already sent错误
 ob_start();
 
+// 辅助函数：将 php.ini 中的大小字符串转换为字节数
+function convertToBytes($value)
+{
+    if (empty($value)) {
+        return null;
+    }
+    $value = trim($value);
+    $last = strtolower($value[strlen($value) - 1]);
+    $numeric = (int)$value;
+    switch ($last) {
+        case 'g':
+            $numeric *= 1024;
+        case 'm':
+            $numeric *= 1024;
+        case 'k':
+            $numeric *= 1024;
+    }
+    return $numeric;
+}
+
 // 动态获取最大文件上传大小
-function getMaxFileSize() {
+function getMaxFileSize()
+{
     global $CONFIG;
 
-    // 辅助函数：将 php.ini 中的大小字符串转换为字节数
-    $convertToBytes = function($value) {
-        if (empty($value)) {
-            return null;
-        }
-        $value = trim($value);
-        $last = strtolower($value[strlen($value) - 1]);
-        $numeric = (int)$value;
-        switch ($last) {
-            case 'g':
-                $numeric *= 1024;
-            case 'm':
-                $numeric *= 1024;
-            case 'k':
-                $numeric *= 1024;
-        }
-        return $numeric;
-    };
-
     // 从 PHP 配置中获取 upload_max_filesize 和 post_max_size
-    $uploadMaxFilesize = $convertToBytes(ini_get('upload_max_filesize'));
-    $postMaxSize = $convertToBytes(ini_get('post_max_size'));
+    $uploadMaxFilesize = convertToBytes(ini_get('upload_max_filesize'));
+    $postMaxSize = convertToBytes(ini_get('post_max_size'));
 
     // 取两者中的较小值
     if ($uploadMaxFilesize !== null && $postMaxSize !== null) {
@@ -58,12 +66,20 @@ function getMaxFileSize() {
 // 动态设置最大文件大小
 $CONFIG['MAX_FILE_SIZE'] = getMaxFileSize();
 
+// 动态调整分片大小，确保不超过 upload_max_filesize 的 50%
+// 这样可以为表单字段留出足够的空间
+$uploadLimit = $CONFIG['MAX_FILE_SIZE'];
+$CONFIG['CHUNK_SIZE'] = max(500 * 1024, intval($uploadLimit * 0.5)); // 最小 500KB，最大为限制的一半
+// 确保分片大小不超过 5MB
+$CONFIG['CHUNK_SIZE'] = min($CONFIG['CHUNK_SIZE'], 5 * 1024 * 1024);
+
 // 获取当前脚本完整URL，用于动态生成链接
 $currentFile = $_SERVER['PHP_SELF'];
 
 // 自定义gzdecode函数，兼容PHP 5.2版本
 if (!function_exists('gzdecode')) {
-    function gzdecode($data) {
+    function gzdecode($data)
+    {
         $len = strlen($data);
         if ($len < 18 || strcmp(substr($data, 0, 2), "\x1f\x8b")) {
             return null; // Not GZIP format
@@ -131,7 +147,8 @@ $success = '';
 $uploadedFiles = array();
 
 // 辅助函数 - 安全处理文件名和文件夹名
-function sanitizePath($path, $isFileName = false) {
+function sanitizePath($path, $isFileName = false)
+{
     // 支持中文等Unicode字符，只移除危险字符
     // 如果是文件名，允许包含点号
     $pattern = $isFileName ? '/[^\p{L}\p{N}\-\.\/]/u' : '/[^\p{L}\p{N}\-\/]/u';
@@ -139,7 +156,8 @@ function sanitizePath($path, $isFileName = false) {
 }
 
 // 辅助函数 - 处理中文路径的basename函数
-function mb_basename($path) {
+function mb_basename($path)
+{
     $path = rtrim($path, '/');
     if (empty($path)) {
         return '';
@@ -152,7 +170,8 @@ function mb_basename($path) {
 }
 
 // 辅助函数 - 处理中文路径的dirname函数
-function mb_dirname($path) {
+function mb_dirname($path)
+{
     $path = rtrim($path, '/');
     $lastSlash = strrpos($path, '/');
     if ($lastSlash === false) {
@@ -163,48 +182,82 @@ function mb_dirname($path) {
 }
 
 // 辅助函数 - 判断是否为文本文件
-function isTextFile($fileName) {
+function isTextFile($fileName)
+{
     // 使用关联数组（哈希表）提高查找效率
     $textExtensions = array(
-        'txt' => true, 'md' => true, 'html' => true, 'htm' => true, 'css' => true, 'js' => true, 'php' => true, 
-        'py' => true, 'java' => true, 'c' => true, 'cpp' => true, 'h' => true, 'hpp' => true,
-        'json' => true, 'xml' => true, 'ini' => true, 'conf' => true, 'log' => true, 'sh' => true, 
-        'bat' => true, 'cmd' => true, 'csv' => true, 'tsv' => true, 'yaml' => true, 'yml' => true,
-        'sql' => true, 'pl' => true, 'rb' => true, 'swift' => true, 'go' => true, 'rs' => true, 
-        'kt' => true, 'vue' => true, 'jsx' => true, 'tsx' => true, 'scss' => true, 'sass' => true
+        'txt' => true,
+        'md' => true,
+        'html' => true,
+        'htm' => true,
+        'css' => true,
+        'js' => true,
+        'php' => true,
+        'py' => true,
+        'java' => true,
+        'c' => true,
+        'cpp' => true,
+        'h' => true,
+        'hpp' => true,
+        'json' => true,
+        'xml' => true,
+        'ini' => true,
+        'conf' => true,
+        'log' => true,
+        'sh' => true,
+        'bat' => true,
+        'cmd' => true,
+        'csv' => true,
+        'tsv' => true,
+        'yaml' => true,
+        'yml' => true,
+        'sql' => true,
+        'pl' => true,
+        'rb' => true,
+        'swift' => true,
+        'go' => true,
+        'rs' => true,
+        'kt' => true,
+        'vue' => true,
+        'jsx' => true,
+        'tsx' => true,
+        'scss' => true,
+        'sass' => true
     );
-    
+
     $extension = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
     return isset($textExtensions[$extension]);
 }
 
 // 辅助函数 - 验证路径安全性
-function validatePath($path, $basePath) {
+function validatePath($path, $basePath)
+{
     // 简化路径验证逻辑，使用realpath和strpos双重检查
     $realPath = @realpath($path);
     $realBasePath = @realpath($basePath);
-    
+
     // 如果realpath成功，使用realpath结果进行检查
     if ($realPath !== false && $realBasePath !== false) {
         return strpos($realPath, $realBasePath) === 0;
     }
-    
+
     // 否则使用原始路径进行基本检查
     return strpos($path, $basePath) === 0;
 }
 
 // 辅助函数 - 递归删除文件夹
-function deleteDirectory($dir) {
+function deleteDirectory($dir)
+{
     // 检查路径是否存在
     if (!file_exists($dir)) {
         return true;
     }
-    
+
     // 如果是文件，直接删除
     if (!is_dir($dir)) {
         return unlink($dir);
     }
-    
+
     // 遍历目录内容
     $items = scandir($dir);
     foreach ($items as $item) {
@@ -212,32 +265,33 @@ function deleteDirectory($dir) {
         if ($item === '.' || $item === '..') {
             continue;
         }
-        
+
         // 构建完整路径
         $itemPath = $dir . DIRECTORY_SEPARATOR . $item;
-        
+
         // 递归删除子项
         if (!deleteDirectory($itemPath)) {
             return false;
         }
     }
-    
+
     // 删除空目录
     return rmdir($dir);
 }
 
 // 辅助函数 - 递归复制文件夹
-function copyDirectory($src, $dst) {
+function copyDirectory($src, $dst)
+{
     if (!file_exists($dst)) {
         mkdir($dst, 0755, true);
     }
-    
+
     $dir = opendir($src);
     while (false !== ($file = readdir($dir))) {
         if ($file != '.' && $file != '..') {
             $srcFile = $src . DIRECTORY_SEPARATOR . $file;
             $dstFile = $dst . DIRECTORY_SEPARATOR . $file;
-            
+
             if (is_dir($srcFile)) {
                 copyDirectory($srcFile, $dstFile);
             } else {
@@ -250,17 +304,18 @@ function copyDirectory($src, $dst) {
 }
 
 // 辅助函数 - 递归收集所有文件
-function collectAllFiles($dir, &$fileList, $baseDir = null) {
+function collectAllFiles($dir, &$fileList, $baseDir = null)
+{
     if ($baseDir === null) {
         $baseDir = $dir;
     }
-    
+
     $handle = opendir($dir);
     while (false !== ($file = readdir($handle))) {
         if ($file != '.' && $file != '..') {
             $fullPath = $dir . DIRECTORY_SEPARATOR . $file;
             $relativePath = substr($fullPath, strlen($baseDir) + 1);
-            
+
             if (is_dir($fullPath)) {
                 // 递归处理子目录
                 collectAllFiles($fullPath, $fileList, $baseDir);
@@ -274,13 +329,14 @@ function collectAllFiles($dir, &$fileList, $baseDir = null) {
 }
 
 // 辅助函数 - 获取所有文件夹列表
-function getFolderTree($baseDir, $currentDir = '', &$result = array()) {
+function getFolderTree($baseDir, $currentDir = '', &$result = array())
+{
     $fullPath = $baseDir . '/' . $currentDir;
     $folders = scandir($fullPath);
-    
+
     foreach ($folders as $folder) {
         if ($folder === '.' || $folder === '..') continue;
-        
+
         $folderPath = $fullPath . '/' . $folder;
         if (is_dir($folderPath)) {
             $relativePath = $currentDir . '/' . $folder;
@@ -288,7 +344,7 @@ function getFolderTree($baseDir, $currentDir = '', &$result = array()) {
             getFolderTree($baseDir, $relativePath, $result);
         }
     }
-    
+
     return $result;
 }
 
@@ -332,7 +388,7 @@ if (isset($_POST['change_password'])) {
     $currentPassword = stripslashes($_POST['current_password']);
     $newPassword = stripslashes($_POST['new_password']);
     $confirmPassword = stripslashes($_POST['confirm_password']);
-    
+
     // 验证当前密码
     if ($currentPassword !== $CONFIG['ACCESS_PASSWORD']) {
         $errorUrl = $currentFile . '?error=' . urlencode('当前密码错误，请重试。');
@@ -342,7 +398,7 @@ if (isset($_POST['change_password'])) {
         header('Location: ' . $errorUrl);
         exit();
     }
-    
+
     // 验证新密码长度
     if (strlen($newPassword) < 6) {
         $errorUrl = $currentFile . '?error=' . urlencode('新密码长度不能少于6个字符。');
@@ -352,7 +408,7 @@ if (isset($_POST['change_password'])) {
         header('Location: ' . $errorUrl);
         exit();
     }
-    
+
     // 验证两次输入的新密码是否一致
     if ($newPassword !== $confirmPassword) {
         $errorUrl = $currentFile . '?error=' . urlencode('两次输入的新密码不一致，请重试。');
@@ -362,24 +418,24 @@ if (isset($_POST['change_password'])) {
         header('Location: ' . $errorUrl);
         exit();
     }
-    
+
     // 读取当前脚本内容
     $scriptContent = file_get_contents(__FILE__);
-    
+
     // 使用正则表达式替换密码
     $oldPasswordPattern = '/\'ACCESS_PASSWORD\'\s*=>\s*\'[^\']+\'/';
     $newPasswordLine = "'ACCESS_PASSWORD' => '{$newPassword}'";
     $newScriptContent = preg_replace($oldPasswordPattern, $newPasswordLine, $scriptContent);
-    
+
     // 写入修改后的脚本内容
     if (file_put_contents(__FILE__, $newScriptContent)) {
         // 修改成功，更新当前会话中的密码
         $CONFIG['ACCESS_PASSWORD'] = $newPassword;
-        
+
         // 重新设置认证cookie
         $authToken = md5(uniqid(rand(), true));
         setcookie($CONFIG['AUTH_COOKIE_NAME'], $authToken, time() + $CONFIG['AUTH_COOKIE_EXPIRE'], '/');
-        
+
         // 构建正确的重定向URL
         $redirectUrl = $currentFile . '?success=' . urlencode('密码修改成功！请使用新密码登录。');
         if (isset($_GET['path'])) {
@@ -404,7 +460,7 @@ $isAuthenticated = isset($_COOKIE[$CONFIG['AUTH_COOKIE_NAME']]);
 // 如果用户已通过验证，则加载文件上传和文件列表功能
 if ($isAuthenticated) {
     $basePath = dirname(__FILE__);
-    
+
     // 处理获取文件夹列表的请求
     if (isset($_GET['get_folders'])) {
         // 返回所有文件夹的JSON数据
@@ -413,7 +469,138 @@ if ($isAuthenticated) {
         echo json_encode($folders);
         exit();
     }
-    
+
+    // 处理分片上传
+    if (isset($_POST['chunk_upload'])) {
+        $fileId = stripslashes($_POST['file_id']);
+        $chunkIndex = intval($_POST['chunk_index']);
+        $totalChunks = intval($_POST['total_chunks']);
+        $fileName = sanitizePath(stripslashes($_POST['file_name']), true);
+        $fileSize = intval($_POST['file_size']);
+
+        // 验证文件大小不超过最大限制
+        if ($fileSize > $CONFIG['MAX_UPLOAD_SIZE']) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '文件大小超过最大限制 (' . formatFileSize($CONFIG['MAX_UPLOAD_SIZE']) . ')'));
+            exit();
+        }
+
+        // 检查文件上传是否有错误
+        if (!isset($_FILES['chunk_data']) || $_FILES['chunk_data']['error'] !== UPLOAD_ERR_OK) {
+            $errorMsg = '分片上传失败';
+            if (isset($_FILES['chunk_data'])) {
+                switch ($_FILES['chunk_data']['error']) {
+                    case UPLOAD_ERR_INI_SIZE:
+                        $errorMsg = '分片大小超过 PHP upload_max_filesize 限制 (' . ini_get('upload_max_filesize') . ')';
+                        break;
+                    case UPLOAD_ERR_FORM_SIZE:
+                        $errorMsg = '分片大小超过表单 MAX_FILE_SIZE 限制';
+                        break;
+                    case UPLOAD_ERR_NO_FILE:
+                        $errorMsg = '没有接收到文件数据 (可能超过 post_max_size: ' . ini_get('post_max_size') . ')';
+                        break;
+                    case UPLOAD_ERR_PARTIAL:
+                        $errorMsg = '文件只部分上传';
+                        break;
+                    default:
+                        $errorMsg = '上传错误代码: ' . $_FILES['chunk_data']['error'];
+                }
+            } else {;
+                $errorMsg = '未接收到文件，可能超过 post_max_size (' . ini_get('post_max_size') . ')';
+            }
+
+            header('Content-Type: application/json');
+            echo json_encode(array(
+                'success' => false,
+                'error' => $errorMsg
+            ));
+            exit();
+        }
+
+        // 创建临时目录
+        $chunkDir = $basePath . '/' . $CONFIG['CHUNK_DIR'] . '/' . $fileId;
+        if (!file_exists($chunkDir)) {
+            mkdir($chunkDir, 0755, true);
+        }
+
+        // 保存分片文件
+        $chunkFile = $chunkDir . '/' . $chunkIndex;
+        if (move_uploaded_file($_FILES['chunk_data']['tmp_name'], $chunkFile)) {
+            // 保存元数据
+            file_put_contents($chunkDir . '/meta.json', json_encode(array(
+                'file_name' => $fileName,
+                'file_size' => $fileSize,
+                'total_chunks' => $totalChunks
+            )));
+
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => true, 'chunk_index' => $chunkIndex));
+        } else {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '无法保存分片文件，请检查目录权限'));
+        }
+        exit();
+    }
+
+    // 处理分片合并
+    if (isset($_POST['chunk_merge'])) {
+        $fileId = stripslashes($_POST['file_id']);
+        $chunkDir = $basePath . '/' . $CONFIG['CHUNK_DIR'] . '/' . $fileId;
+
+        // 读取元数据
+        $metaFile = $chunkDir . '/meta.json';
+        if (!file_exists($metaFile)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '元数据不存在'));
+            exit();
+        }
+
+        $meta = json_decode(file_get_contents($metaFile), true);
+        $currentPath = isset($_POST['current_path']) ? stripslashes($_POST['current_path']) : '';
+
+        // 构建目标文件路径
+        $targetDir = $basePath . ($currentPath ? '/' . $currentPath : '');
+        $targetFile = $targetDir . '/' . $meta['file_name'];
+
+        // 检查文件是否已存在
+        if (file_exists($targetFile)) {
+            $filenameWithoutExt = pathinfo($meta['file_name'], PATHINFO_FILENAME);
+            $fileExt = pathinfo($meta['file_name'], PATHINFO_EXTENSION);
+            $meta['file_name'] = $filenameWithoutExt . '_' . time() . '.' . $fileExt;
+            $targetFile = $targetDir . '/' . $meta['file_name'];
+        }
+
+        // 合并分片
+        $targetHandle = fopen($targetFile, 'wb');
+        if (!$targetHandle) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '无法创建目标文件'));
+            exit();
+        }
+
+        for ($i = 0; $i < $meta['total_chunks']; $i++) {
+            $chunkFile = $chunkDir . '/' . $i;
+            if (file_exists($chunkFile)) {
+                $chunkData = file_get_contents($chunkFile);
+                fwrite($targetHandle, $chunkData);
+            } else {
+                fclose($targetHandle);
+                unlink($targetFile);
+                header('Content-Type: application/json');
+                echo json_encode(array('success' => false, 'error' => '分片 ' . $i . ' 缺失'));
+                exit();
+            }
+        }
+        fclose($targetHandle);
+
+        // 清理临时文件
+        deleteDirectory($chunkDir);
+
+        header('Content-Type: application/json');
+        echo json_encode(array('success' => true, 'file_name' => $meta['file_name']));
+        exit();
+    }
+
     // 处理文件编辑请求
     if (isset($_GET['edit'])) {
         $fileNameToEdit = rawurldecode($_GET['edit']);
@@ -424,23 +611,23 @@ if ($isAuthenticated) {
         if ($currentPath === '.') {
             $currentPath = '';
         }
-        
+
         // 检查是否为文本文件
         if (!isTextFile(mb_basename($fileToEdit))) {
             header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('只允许编辑文本文件'));
             exit();
         }
-        
+
         // 处理表单提交
         if (isset($_POST['save_file'])) {
             $fileContent = stripslashes($_POST['file_content']);
-            
+
             // 安全检查
             if (!file_exists($fileToEdit) || !is_file($fileToEdit) || !validatePath($fileToEdit, $basePath)) {
                 header('Location: ' . $currentFile . '?error=' . urlencode('无效的文件编辑请求'));
                 exit();
             }
-            
+
             // 保存文件
             if (file_put_contents($fileToEdit, $fileContent) !== false) {
                 header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&success=' . urlencode('文件已成功保存：' . mb_basename($fileNameToEdit)));
@@ -450,12 +637,12 @@ if ($isAuthenticated) {
                 exit();
             }
         }
-        
+
         // 显示编辑表单
         if (file_exists($fileToEdit) && is_file($fileToEdit) && validatePath($fileToEdit, $basePath)) {
             $fileContent = file_get_contents($fileToEdit);
             $fileName = mb_basename($fileToEdit);
-            
+
             // 显示编辑页面
             echo '<!DOCTYPE html>
             <html lang="zh-CN">
@@ -618,7 +805,7 @@ if ($isAuthenticated) {
             exit();
         }
     }
-    
+
     // 处理重命名请求
     if (isset($_GET['rename'])) {
         $oldPath = rawurldecode($_GET['rename']);
@@ -629,40 +816,40 @@ if ($isAuthenticated) {
         if ($currentPath === '.') {
             $currentPath = '';
         }
-        
+
         // 构建完整路径
         $oldFullPath = $basePath . '/' . $oldPath;
         // 使用自定义函数处理中文路径
         $oldName = mb_basename($oldFullPath);
-        
+
         // 处理表单提交
         if (isset($_POST['rename_item'])) {
             $newName = stripslashes($_POST['new_name']);
-            
+
             // 安全处理新名称
             $newName = sanitizePath($newName, true);
-            
+
             // 检查新名称是否为空
             if (empty($newName)) {
                 header('Location: ' . $currentFile . '?error=' . urlencode('名称不能为空'));
                 exit();
             }
-            
+
             // 构建新路径
             $newFullPath = mb_dirname($oldFullPath) . '/' . $newName;
-            
+
             // 安全检查
             if (!file_exists($oldFullPath) || !validatePath($oldFullPath, $basePath) || !validatePath($newFullPath, $basePath)) {
                 header('Location: ' . $currentFile . '?error=' . urlencode('无效的重命名请求'));
                 exit();
             }
-            
+
             // 检查新名称是否已存在
             if (file_exists($newFullPath)) {
                 header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('名称已存在：' . $newName));
                 exit();
             }
-            
+
             // 执行重命名
             if (rename($oldFullPath, $newFullPath)) {
                 header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&success=' . urlencode(ucfirst($itemType) . '已成功重命名：' . $oldName . ' → ' . $newName));
@@ -672,7 +859,7 @@ if ($isAuthenticated) {
                 exit();
             }
         }
-        
+
         // 显示重命名表单
         if (file_exists($oldFullPath) && validatePath($oldFullPath, $basePath)) {
             // 显示重命名页面
@@ -784,31 +971,31 @@ if ($isAuthenticated) {
             exit();
         }
     }
-    
 
-    
+
+
     // 处理文件删除请求
     if (isset($_GET['delete'])) {
         // 使用urldecode解码文件名，并确保完整恢复原始文件名
         $fileNameToDelete = rawurldecode($_GET['delete']);
-        
+
         // 安全处理文件名
         $fileNameToDelete = sanitizePath($fileNameToDelete, true);
-        
+
         // 构建完整路径
         $fileToDelete = $basePath . '/' . $fileNameToDelete;
-        
+
         // 添加额外的安全检查，确保文件名不为空且不只是扩展名
         if (empty($fileNameToDelete) || strpos($fileNameToDelete, '.') === 0) {
             // 使用PRG模式
             header('Location: ' . $currentFile . '?error=' . urlencode('无效的文件名格式: ' . $fileNameToDelete));
             exit();
         }
-        
+
         // 安全检查，确保不能删除当前脚本文件或非本目录文件
         $validFile = true;
         $errorReason = '';
-        
+
         if ($fileNameToDelete === $currentFile) {
             $validFile = false;
             $errorReason = '禁止删除当前脚本文件';
@@ -822,13 +1009,13 @@ if ($isAuthenticated) {
             $validFile = false;
             $errorReason = '文件不在允许的目录内: ' . $fileNameToDelete;
         }
-        
+
         // 获取当前路径或文件所在目录
         $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : mb_dirname($fileNameToDelete);
         if ($currentPath === '.') {
             $currentPath = ''; // 当前目录
         }
-        
+
         if ($validFile) {
             if (unlink($fileToDelete)) {
                 // 使用URL参数传递成功消息，并保留当前路径
@@ -861,41 +1048,42 @@ if ($isAuthenticated) {
             }
             exit();
         }
-            }
-            
+    }
 
-            
+
+
     // 辅助函数 - 解压tar文件
-    function extractTarFile($tarFilePath, $extractDir) {
+    function extractTarFile($tarFilePath, $extractDir)
+    {
         // 确保目标目录存在
         if (!file_exists($extractDir)) {
             mkdir($extractDir, 0755, true);
         }
-        
+
         // 打开tar文件
         $tar = fopen($tarFilePath, 'rb');
         if (!$tar) {
             return false;
         }
-        
+
         $extractedFiles = array();
-        
+
         // 读取tar文件头
         while (!feof($tar)) {
             $header = fread($tar, 512);
             if (strlen($header) < 512) {
                 break;
             }
-            
+
             // 获取文件名
             $fileName = trim(substr($header, 0, 100));
             if (empty($fileName)) {
                 break;
             }
-            
+
             // 获取文件大小
             $fileSize = octdec(trim(substr($header, 124, 12)));
-            
+
             // 跳过目录
             if (substr($fileName, -1) === '/') {
                 $dirPath = $extractDir . '/' . $fileName;
@@ -906,57 +1094,57 @@ if ($isAuthenticated) {
                 fseek($tar, (ceil($fileSize / 512) * 512), SEEK_CUR);
                 continue;
             }
-            
+
             // 读取文件内容
             $fileContent = fread($tar, $fileSize);
-            
+
             // 计算需要跳过的字节数（tar文件按512字节块对齐）
             $skipBytes = (ceil($fileSize / 512) * 512) - $fileSize;
             if ($skipBytes > 0) {
                 fseek($tar, $skipBytes, SEEK_CUR);
             }
-            
+
             // 写入文件
             $filePath = $extractDir . '/' . $fileName;
             $fileDir = dirname($filePath);
             if (!file_exists($fileDir)) {
                 mkdir($fileDir, 0755, true);
             }
-            
+
             if (file_put_contents($filePath, $fileContent) === false) {
                 fclose($tar);
                 return false;
             }
-            
+
             array_push($extractedFiles, $fileName);
         }
-        
+
         fclose($tar);
         return $extractedFiles;
     }
-    
+
     // 处理GZ解压请求
     if (isset($_GET['ungzip'])) {
         // 使用urldecode解码文件名
         $fileNameToUngzip = rawurldecode($_GET['ungzip']);
-        
+
         // 安全处理文件名
         $fileNameToUngzip = sanitizePath($fileNameToUngzip, true);
-        
+
         // 检查文件是否以.gz结尾
         if (substr($fileNameToUngzip, -3) !== '.gz') {
             header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('无效的压缩文件格式，仅支持.gz文件'));
             exit();
         }
-        
+
         // 构建完整路径
         $fileToUngzip = $basePath . '/' . $fileNameToUngzip;
         $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : mb_dirname($fileNameToUngzip);
-        
+
         // 安全检查
         $validFile = true;
         $errorReason = '';
-        
+
         if (empty($fileNameToUngzip) || strpos($fileNameToUngzip, '.') === 0) {
             $validFile = false;
             $errorReason = '无效的文件名格式';
@@ -970,90 +1158,90 @@ if ($isAuthenticated) {
             $validFile = false;
             $errorReason = '文件不在允许的目录内';
         }
-                
-                if ($validFile) {
-                    // 实现GZ解压
-                    $gzippedContent = file_get_contents($fileToUngzip);
-                    $ungzippedContent = gzdecode($gzippedContent);
-                    
-                    if ($ungzippedContent === false) {
-                        header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压失败，文件可能已损坏或不是有效的GZ文件'));
+
+        if ($validFile) {
+            // 实现GZ解压
+            $gzippedContent = file_get_contents($fileToUngzip);
+            $ungzippedContent = gzdecode($gzippedContent);
+
+            if ($ungzippedContent === false) {
+                header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压失败，文件可能已损坏或不是有效的GZ文件'));
+                exit();
+            }
+
+            // 检查是否为tar.gz文件
+            $isTarGz = substr($fileNameToUngzip, -7) === '.tar.gz';
+            $successMessage = '';
+
+            if ($isTarGz) {
+                // 处理tar.gz文件
+                $tarFileName = substr($fileToUngzip, 0, -3);
+
+                // 写入tar文件
+                if (file_put_contents($tarFileName, $ungzippedContent)) {
+                    // 解压tar文件
+                    $extractDir = dirname($tarFileName);
+                    $extractedFiles = extractTarFile($tarFileName, $extractDir);
+
+                    // 删除临时tar文件（无论解压成功与否）
+                    unlink($tarFileName);
+
+                    if ($extractedFiles) {
+                        $successMessage = 'Tar.gz文件已成功解压，共解压 ' . count($extractedFiles) . ' 个文件';
+                    } else {
+                        header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压tar文件失败'));
                         exit();
                     }
-                    
-                    // 检查是否为tar.gz文件
-                    $isTarGz = substr($fileNameToUngzip, -7) === '.tar.gz';
-                    $successMessage = '';
-                    
-                    if ($isTarGz) {
-                        // 处理tar.gz文件
-                        $tarFileName = substr($fileToUngzip, 0, -3);
-                        
-                        // 写入tar文件
-                        if (file_put_contents($tarFileName, $ungzippedContent)) {
-                            // 解压tar文件
-                            $extractDir = dirname($tarFileName);
-                            $extractedFiles = extractTarFile($tarFileName, $extractDir);
-                            
-                            // 删除临时tar文件（无论解压成功与否）
-                            unlink($tarFileName);
-                            
-                            if ($extractedFiles) {
-                                $successMessage = 'Tar.gz文件已成功解压，共解压 ' . count($extractedFiles) . ' 个文件';
-                            } else {
-                                header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压tar文件失败'));
-                                exit();
-                            }
-                        } else {
-                            $permissionsError = '创建tar文件失败，请检查服务器权限。';
-                            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode($permissionsError));
-                            exit();
-                        }
-                    } else {
-                        // 处理普通gz文件
-                        $ungzippedFile = substr($fileToUngzip, 0, -3);
-                        
-                        if (file_exists($ungzippedFile)) {
-                            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压文件已存在'));
-                            exit();
-                        }
-                        
-                        if (file_put_contents($ungzippedFile, $ungzippedContent)) {
-                            $successMessage = '文件已成功解压：' . substr($fileNameToUngzip, 0, -3);
-                        } else {
-                            $permissionsError = '解压文件失败，请检查服务器权限。';
-                            $uploadDir = dirname(__FILE__) . '/';
-                            if (!is_writable($uploadDir)) {
-                                $permissionsError = '服务器没有写入权限，无法创建解压文件。请联系管理员设置正确的权限。';
-                            }
-                            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode($permissionsError));
-                            exit();
-                        }
-                    }
-                    
-                    header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&success=' . urlencode($successMessage));
-                    exit();
                 } else {
-                    header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('无效的解压请求: ' . $errorReason));
+                    $permissionsError = '创建tar文件失败，请检查服务器权限。';
+                    header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode($permissionsError));
+                    exit();
+                }
+            } else {
+                // 处理普通gz文件
+                $ungzippedFile = substr($fileToUngzip, 0, -3);
+
+                if (file_exists($ungzippedFile)) {
+                    header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压文件已存在'));
+                    exit();
+                }
+
+                if (file_put_contents($ungzippedFile, $ungzippedContent)) {
+                    $successMessage = '文件已成功解压：' . substr($fileNameToUngzip, 0, -3);
+                } else {
+                    $permissionsError = '解压文件失败，请检查服务器权限。';
+                    $uploadDir = dirname(__FILE__) . '/';
+                    if (!is_writable($uploadDir)) {
+                        $permissionsError = '服务器没有写入权限，无法创建解压文件。请联系管理员设置正确的权限。';
+                    }
+                    header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode($permissionsError));
                     exit();
                 }
             }
+
+            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&success=' . urlencode($successMessage));
+            exit();
+        } else {
+            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('无效的解压请求: ' . $errorReason));
+            exit();
+        }
+    }
 
     // 处理文件夹删除请求
     if (isset($_GET['delete_folder'])) {
         // 使用urldecode解码文件夹名
         $folderNameToDelete = rawurldecode($_GET['delete_folder']);
-        
+
         // 安全处理文件夹名
         $folderNameToDelete = sanitizePath($folderNameToDelete);
-        
+
         // 构建完整路径
         $folderToDelete = $basePath . '/' . $folderNameToDelete;
-        
+
         // 安全检查
         $validFolder = true;
         $errorReason = '';
-        
+
         if (empty($folderNameToDelete)) {
             $validFolder = false;
             $errorReason = '文件夹名称不能为空';
@@ -1067,7 +1255,7 @@ if ($isAuthenticated) {
             // 安全检查确保不能删除根目录或不在允许的目录内
             $realFolderPath = @realpath($folderToDelete);
             $realBasePath = @realpath($basePath);
-            
+
             if ($realFolderPath === false || $realBasePath === false || $realFolderPath === $realBasePath) {
                 $validFolder = false;
                 $errorReason = '不允许删除此文件夹';
@@ -1076,13 +1264,13 @@ if ($isAuthenticated) {
                 $errorReason = '文件夹不在允许的目录内: ' . $folderNameToDelete;
             }
         }
-        
+
         // 获取当前路径或文件夹所在目录
         $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : mb_dirname($folderNameToDelete);
         if ($currentPath === '.') {
             $currentPath = ''; // 当前目录
         }
-        
+
         if ($validFolder) {
             if (deleteDirectory($folderToDelete)) {
                 // 使用URL参数传递成功消息，并保留当前路径
@@ -1117,19 +1305,19 @@ if ($isAuthenticated) {
     if (isset($_POST['create_folder']) && !empty($_POST['folder_name'])) {
         $folderName = stripslashes($_POST['folder_name']);
         $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : '';
-        
+
         // 安全处理文件夹名
         $folderName = sanitizePath($folderName);
-        
+
         // 确保文件夹名不为空
         if (empty($folderName)) {
             header('Location: ' . $currentFile . '?error=' . urlencode('文件夹名称不能为空'));
             exit();
         }
-        
+
         // 构建完整的文件夹路径
         $folderPath = $basePath . '/' . ($currentPath ? $currentPath . '/' : '') . $folderName;
-        
+
         // 检查文件夹是否已存在
         if (file_exists($folderPath)) {
             if ($currentPath) {
@@ -1139,7 +1327,7 @@ if ($isAuthenticated) {
             }
             exit();
         }
-        
+
         // 创建文件夹
         if (mkdir($folderPath, 0755, true)) {
             if ($currentPath) {
@@ -1157,24 +1345,24 @@ if ($isAuthenticated) {
             exit();
         }
     }
-    
+
     // 处理新建文件请求
     if (isset($_POST['create_file']) && !empty($_POST['file_name'])) {
         $fileName = stripslashes($_POST['file_name']);
         $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : '';
-        
+
         // 安全处理文件名
         $fileName = sanitizePath($fileName, true);
-        
+
         // 确保文件名不为空
         if (empty($fileName)) {
             header('Location: ' . $currentFile . '?error=' . urlencode('文件名不能为空'));
             exit();
         }
-        
+
         // 构建完整的文件路径
         $filePath = $basePath . '/' . ($currentPath ? $currentPath . '/' : '') . $fileName;
-        
+
         // 检查文件是否已存在
         if (file_exists($filePath)) {
             if ($currentPath) {
@@ -1184,7 +1372,7 @@ if ($isAuthenticated) {
             }
             exit();
         }
-        
+
         // 创建空文件
         if (touch($filePath)) {
             if ($currentPath) {
@@ -1207,17 +1395,17 @@ if ($isAuthenticated) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['batch_action'])) {
         $batchAction = $_POST['batch_action'];
         $currentPath = isset($_POST['current_path']) ? $_POST['current_path'] : '';
-        
+
         if ($batchAction === 'delete' && isset($_POST['selected_items'])) {
             $selectedItems = $_POST['selected_items'];
             $deletedCount = 0;
             $failedCount = 0;
-            
+
             foreach ($selectedItems as $item) {
                 $itemType = $item['type'];
                 $itemPath = rawurldecode($item['path']);
                 $fullPath = $basePath . '/' . $itemPath;
-                
+
                 // 安全检查
                 if (validatePath($fullPath, $basePath)) {
                     if ($itemType === 'file') {
@@ -1237,18 +1425,18 @@ if ($isAuthenticated) {
                     $failedCount++;
                 }
             }
-            
+
             // 重定向到原页面并显示结果
             $successMessage = "批量删除完成：成功删除 $deletedCount 个项目，失败 $failedCount 个项目";
             header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&success=' . urlencode($successMessage));
             exit();
         } elseif ($batchAction === 'compress' && isset($_POST['selected_items'])) {
             $selectedItems = $_POST['selected_items'];
-            
+
             // 创建临时目录
             $tempDir = $basePath . '/temp_' . time() . '_' . rand(1000, 9999);
             mkdir($tempDir, 0755, true);
-            
+
             try {
                 // 复制选中的文件和文件夹到临时目录
                 foreach ($selectedItems as $item) {
@@ -1256,7 +1444,7 @@ if ($isAuthenticated) {
                     $itemPath = rawurldecode($item['path']);
                     $fullPath = $basePath . '/' . $itemPath;
                     $tempPath = $tempDir . '/' . basename($itemPath);
-                    
+
                     // 安全检查
                     if (validatePath($fullPath, $basePath)) {
                         if ($itemType === 'file') {
@@ -1267,26 +1455,27 @@ if ($isAuthenticated) {
                         }
                     }
                 }
-                
+
                 // 递归收集所有文件
                 $allFiles = array();
                 collectAllFiles($tempDir, $allFiles);
-                
+
                 if (empty($allFiles)) {
                     throw new Exception('没有找到可压缩的文件');
                 }
-                
+
                 // 生成标准tar文件内容
                 $tarContent = '';
-                
+
                 // 为每个文件生成tar头和内容
                 foreach ($allFiles as $filePath => $relativePath) {
                     $fileContent = file_get_contents($filePath);
                     $fileSize = strlen($fileContent);
                     $mtime = filemtime($filePath);
-                    
+
                     // Tar文件头格式（512字节）
-                    $tarHeader = pack('a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12',
+                    $tarHeader = pack(
+                        'a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12',
                         $relativePath,          // 文件名 (100 bytes)
                         sprintf('%07o ', 0644),   // 文件权限 (8 bytes)
                         sprintf('%07o ', 0),      // 所有者ID (8 bytes)
@@ -1305,13 +1494,13 @@ if ($isAuthenticated) {
                         '',                      // 前缀 (155 bytes)
                         ''                       // 填充 (12 bytes)
                     );
-                    
+
                     // 计算校验和
                     $checksum = 0;
                     for ($i = 0; $i < 512; $i++) {
                         $checksum += ord(substr($tarHeader, $i, 1));
                     }
-                    
+
                     // 更新校验和字段
                     $tarHeader = substr_replace(
                         $tarHeader,
@@ -1319,45 +1508,44 @@ if ($isAuthenticated) {
                         148, // 校验和字段起始位置
                         8    // 校验和字段长度
                     );
-                    
+
                     // 添加文件头和内容到tar文件
                     $tarContent .= $tarHeader;
                     $tarContent .= $fileContent;
-                    
+
                     // 填充到512字节的倍数
                     $padding = (512 - ($fileSize % 512)) % 512;
                     if ($padding > 0) {
                         $tarContent .= str_repeat("\0", $padding);
                     }
                 }
-                
+
                 // 添加tar文件结束标记（两个512字节的空块）
                 $tarContent .= str_repeat("\0", 1024);
-                
+
                 // 压缩为tar.gz格式
                 $gzContent = gzencode($tarContent, 9);
                 $gzFileName = 'archive_' . date('YmdHis') . '.tar.gz';
-                
+
                 // 将压缩文件保存到当前目录
                 $savePath = $basePath . '/' . $currentPath . '/' . $gzFileName;
                 file_put_contents($savePath, $gzContent);
-                
+
                 // 设置下载头
                 header('Content-Type: application/x-gtar');
                 header('Content-Disposition: attachment; filename="' . $gzFileName . '"');
                 header('Content-Length: ' . strlen($gzContent));
-                
+
                 // 输出压缩内容
                 echo $gzContent;
-                
+
                 // 清理临时文件
                 deleteDirectory($tempDir);
                 exit();
-                
             } catch (Exception $e) {
                 // 清理临时文件
                 deleteDirectory($tempDir);
-                
+
                 // 重定向到原页面并显示错误
                 header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('压缩失败：' . $e->getMessage()));
                 exit();
@@ -1366,39 +1554,39 @@ if ($isAuthenticated) {
             $selectedItems = $_POST['selected_items'];
             $targetPath = sanitizePath($_POST['target_path']);
             $targetFullPath = $basePath . '/' . $targetPath;
-            
+
             $successCount = 0;
             $failedCount = 0;
-            
+
             // 确保目标目录存在
             if (!file_exists($targetFullPath)) {
                 mkdir($targetFullPath, 0755, true);
             }
-            
+
             foreach ($selectedItems as $item) {
                 $itemType = $item['type'];
                 $itemPath = rawurldecode($item['path']);
                 $sourceFullPath = $basePath . '/' . $itemPath;
                 $itemName = mb_basename($itemPath);
                 $targetItemPath = $targetFullPath . '/' . $itemName;
-                
+
                 // 安全检查
                 if (validatePath($sourceFullPath, $basePath) && validatePath($targetItemPath, $basePath)) {
                     // 检查目标是否已存在
                     if (!file_exists($targetItemPath)) {
                         $canProcess = true;
-                        
+
                         // 检查是否将文件夹复制/移动到其子文件夹中，防止无限循环
                         if ($itemType === 'folder') {
                             $realSourcePath = realpath($sourceFullPath);
                             $realTargetParentPath = realpath($targetFullPath);
-                            
+
                             if ($realSourcePath === $realTargetParentPath || strpos($realTargetParentPath . '/', $realSourcePath . '/') === 0) {
                                 $canProcess = false;
                                 $failedCount++;
                             }
                         }
-                        
+
                         if ($canProcess) {
                             if ($batchAction === 'move') {
                                 // 执行移动操作
@@ -1439,7 +1627,7 @@ if ($isAuthenticated) {
                     $failedCount++;
                 }
             }
-            
+
             // 重定向到原页面并显示结果
             $actionName = $batchAction === 'move' ? '移动' : '复制';
             $successMessage = "批量$actionName完成：成功$actionName $successCount 个项目，失败 $failedCount 个项目";
@@ -1447,7 +1635,7 @@ if ($isAuthenticated) {
             exit();
         }
     }
-    
+
     // 处理文件上传
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // 批量文件上传处理
@@ -1455,26 +1643,26 @@ if ($isAuthenticated) {
             $totalFiles = count($_FILES['files']['name']);
             $uploadedCount = 0;
             $failedCount = 0;
-            
+
             for ($i = 0; $i < $totalFiles; $i++) {
                 if ($_FILES['files']['error'][$i] === UPLOAD_ERR_OK) {
                     $fileTmpName = $_FILES['files']['tmp_name'][$i];
                     $originalFileName = urldecode($_FILES['files']['name'][$i]);
                     // 安全处理文件名
                     $fileName = sanitizePath($originalFileName, true);
-                    
+
                     if (empty($fileName) || $fileName === '.') {
                         $fileName = 'upload_' . time() . '_' . $i . '.tmp';
                     }
-                    
+
                     $fileSize = $_FILES['files']['size'][$i];
-                    
+
                     // 检查文件大小
                     if ($fileSize > $CONFIG['MAX_FILE_SIZE']) {
                         $failedCount++;
                         continue;
                     }
-                    
+
                     // 获取目标文件夹（如果有）
                     $targetDir = $basePath . '/';
                     if (isset($_POST['target_folder']) && !empty($_POST['target_folder'])) {
@@ -1486,9 +1674,9 @@ if ($isAuthenticated) {
                             mkdir($targetDir, 0755, true);
                         }
                     }
-                    
+
                     $targetFile = $targetDir . $fileName;
-                    
+
                     // 如果文件已存在，添加时间戳以避免覆盖
                     if (file_exists($targetFile)) {
                         $filenameWithoutExt = pathinfo($fileName, PATHINFO_FILENAME);
@@ -1496,9 +1684,9 @@ if ($isAuthenticated) {
                         $fileName = $filenameWithoutExt . '_' . time() . '.' . $fileExt;
                         $targetFile = $targetDir . $fileName;
                     }
-                    
+
                     // 移除mb_convert_encoding调用
-                    
+
                     // 移动上传的文件
                     if (move_uploaded_file($fileTmpName, $targetFile)) {
                         $uploadedCount++;
@@ -1507,7 +1695,7 @@ if ($isAuthenticated) {
                     }
                 }
             }
-            
+
             // 使用PRG模式
             header('Location: ' . $currentFile . '?success=' . urlencode("批量上传完成：成功 $uploadedCount 个文件，失败 $failedCount 个文件"));
             exit();
@@ -1517,14 +1705,14 @@ if ($isAuthenticated) {
             $fileTmpName = $_FILES['folder_file']['tmp_name'];
             $relativePath = urldecode($_POST['relative_path']);
             $originalFileName = urldecode($_FILES['folder_file']['name']);
-            
+
             // 获取用户当前所在路径
             $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : '';
             $safeCurrentPath = sanitizePath($currentPath);
-            
+
             // 安全处理路径
             $safeRelativePath = sanitizePath($relativePath, true);
-            
+
             // 构建完整的目标目录：basePath + 当前路径 + 相对路径的目录部分
             if (empty($safeCurrentPath)) {
                 $targetDir = $basePath . '/' . dirname($safeRelativePath) . '/';
@@ -1532,14 +1720,14 @@ if ($isAuthenticated) {
                 $targetDir = $basePath . '/' . $safeCurrentPath . '/' . dirname($safeRelativePath) . '/';
             }
             $fileName = mb_basename($safeRelativePath);
-            
+
             // 确保目标目录存在
             if (!file_exists($targetDir)) {
                 mkdir($targetDir, 0755, true);
             }
-            
+
             $targetFile = $targetDir . $fileName;
-            
+
             // 移动上传的文件
             if (move_uploaded_file($fileTmpName, $targetFile)) {
                 echo json_encode(array('success' => true, 'file' => $relativePath));
@@ -1551,20 +1739,27 @@ if ($isAuthenticated) {
     }
 
     // 排序函数
-    function sortItems($a, $b) {
+    function sortItems($a, $b)
+    {
         if ($a['type'] !== $b['type']) {
             return $a['type'] === 'folder' ? -1 : 1;
         }
         return strcmp($a['name'], $b['name']);
     }
-    
+
     // 获取目录和文件列表
-    function getFilesAndFolders($path = '') {
+    function getFilesAndFolders($path = '')
+    {
         global $currentFile; // 访问全局变量
         $items = array();
         $currentPath = empty($path) ? dirname(__FILE__) : dirname(__FILE__) . '/' . $path;
         // 移除mb_convert_encoding调用
-        
+
+        // 检查路径是否存在且为目录
+        if (!file_exists($currentPath) || !is_dir($currentPath)) {
+            return $items;
+        }
+
         // 获取文件夹列表
         if ($handle = opendir($currentPath)) {
             while (false !== ($entry = readdir($handle))) {
@@ -1572,7 +1767,7 @@ if ($isAuthenticated) {
                     // 移除mb_convert_encoding调用
                     $fullPath = $currentPath . '/' . $entry;
                     $relativePath = empty($path) ? $entry : $path . '/' . $entry;
-                    
+
                     if (is_dir($fullPath)) {
                         array_push($items, array(
                             'type' => 'folder',
@@ -1594,17 +1789,17 @@ if ($isAuthenticated) {
                 }
             }
             closedir($handle);
-            
+
             // 排序：文件夹在前，然后按名称排序
             usort($items, 'sortItems');
-
         }
-        
+
         return $items;
     }
 
     // 格式化文件大小
-    function formatFileSize($bytes) {
+    function formatFileSize($bytes)
+    {
         if ($bytes >= 1073741824) {
             return number_format($bytes / 1073741824, 2) . ' GB';
         } elseif ($bytes >= 1048576) {
@@ -1617,7 +1812,8 @@ if ($isAuthenticated) {
     }
 
     // 格式化日期时间
-    function formatDateTime($timestamp) {
+    function formatDateTime($timestamp)
+    {
         date_default_timezone_set('Asia/Shanghai');
         return date('Y-m-d H:i:s', $timestamp);
     }
@@ -1626,13 +1822,14 @@ if ($isAuthenticated) {
     $currentPath = isset($_GET['path']) ? rawurldecode($_GET['path']) : '';
     // 安全处理路径
     $currentPath = sanitizePath($currentPath);
-    
+
     // 获取文件和文件夹列表
     $items = getFilesAndFolders($currentPath);
 }
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1642,56 +1839,65 @@ if ($isAuthenticated) {
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-            background-color: #121212; /* 深色背景 */
+            background-color: #121212;
+            /* 深色背景 */
             margin: 0;
             padding: 20px;
-            color: #e0e0e0; /* 浅色文字 */
+            color: #e0e0e0;
+            /* 浅色文字 */
         }
-        
+
         .container {
             max-width: 1000px;
             margin: 0 auto;
-            background: #1e1e1e; /* 深色容器背景 */
+            background: #1e1e1e;
+            /* 深色容器背景 */
             padding: 30px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
         }
-        
+
         h1 {
-            color: #ffffff; /* 白色标题 */
+            color: #ffffff;
+            /* 白色标题 */
             margin-bottom: 30px;
             text-align: center;
         }
-        
+
         h2 {
-            color: #e0e0e0; /* 浅色副标题 */
+            color: #e0e0e0;
+            /* 浅色副标题 */
             margin-top: 40px;
             margin-bottom: 20px;
-            border-bottom: 2px solid #333333; /* 深色边框 */
+            border-bottom: 2px solid #333333;
+            /* 深色边框 */
             padding-bottom: 10px;
         }
-        
-        .upload-form, .password-form, .create-folder-form {
-            background-color: #252525; /* 深色表单背景 */
+
+        .upload-form,
+        .password-form,
+        .create-folder-form {
+            background-color: #252525;
+            /* 深色表单背景 */
             padding: 15px;
             border-radius: 6px;
             margin-bottom: 20px;
             border: 1px solid #333333;
         }
-        
+
         .create-folder-form {
             display: flex;
             gap: 20px;
             align-items: center;
             flex-wrap: wrap;
         }
-        
+
         .create-folder-form form {
             display: flex;
             align-items: center;
             gap: 10px;
         }
-        
+
         .inline-label {
             display: inline-block;
             margin-bottom: 0;
@@ -1699,7 +1905,7 @@ if ($isAuthenticated) {
             color: #e0e0e0;
             white-space: nowrap;
         }
-        
+
         .inline-input {
             display: inline-block;
             margin-bottom: 0;
@@ -1712,9 +1918,10 @@ if ($isAuthenticated) {
             height: 36px;
             box-sizing: border-box;
         }
-        
+
         .inline-button {
-            background-color: #1a73e8; /* 蓝色按钮 */
+            background-color: #1a73e8;
+            /* 蓝色按钮 */
             color: white;
             border: none;
             padding: 8px 20px;
@@ -1728,20 +1935,22 @@ if ($isAuthenticated) {
             align-items: center;
             justify-content: center;
         }
-        
+
         /* 保留原始样式 */
         .form-group {
             margin-bottom: 20px;
         }
-        
+
         label {
             display: block;
             margin-bottom: 8px;
             font-weight: 600;
             color: #e0e0e0;
         }
-        
-        input[type="file"], input[type="password"], select {
+
+        input[type="file"],
+        input[type="password"],
+        select {
             display: block;
             margin-bottom: 15px;
             width: 100%;
@@ -1751,9 +1960,10 @@ if ($isAuthenticated) {
             background-color: #333333;
             color: #e0e0e0;
         }
-        
+
         button {
-            background-color: #1a73e8; /* 蓝色按钮 */
+            background-color: #1a73e8;
+            /* 蓝色按钮 */
             color: white;
             border: none;
             padding: 10px 20px;
@@ -1762,11 +1972,11 @@ if ($isAuthenticated) {
             font-size: 16px;
             transition: background-color 0.3s;
         }
-        
+
         button:hover {
             background-color: #1557b0;
         }
-        
+
         .error {
             color: #ff6b6b;
             background-color: rgba(255, 107, 107, 0.1);
@@ -1775,109 +1985,116 @@ if ($isAuthenticated) {
             margin-bottom: 20px;
             border: 1px solid rgba(255, 107, 107, 0.3);
         }
-        
+
         .success {
             color: #4ade80;
             background-color: rgba(74, 222, 128, 0.1);
             border-color: rgba(74, 222, 128, 0.3);
         }
-        
+
+        .notice-box {
+            padding: 8px;
+            margin: 8px -8px;
+            border-radius: 4px;
+        }
+
         /* 添加图标间距样式 */
         .mr-1 {
             margin-right: 5px;
         }
-        
+
         .mr-2 {
             margin-right: 10px;
         }
-        
+
         .file-list {
             width: 100%;
             border-collapse: collapse;
         }
-        
-        .file-list th, .file-list td {
+
+        .file-list th,
+        .file-list td {
             padding: 12px;
             text-align: left;
             border-bottom: 1px solid #333333;
         }
-        
+
         .file-list th {
             background-color: #252525;
             font-weight: 600;
             color: #e0e0e0;
         }
-        
+
         .file-list tr:hover {
             background-color: rgba(255, 255, 255, 0.05);
         }
-        
+
         .file-link {
             color: #8ab4f8;
             text-decoration: none;
         }
-        
+
         .file-link:hover {
             text-decoration: underline;
         }
-        
+
         .folder-link {
             color: #f59e0b;
             text-decoration: none;
         }
-        
+
         .folder-link:hover {
             text-decoration: underline;
         }
-        
+
         .allowed-types {
             font-size: 14px;
             color: #b0b0b0;
             margin-top: 5px;
         }
-        
+
         .logout {
             text-align: right;
             margin-bottom: 20px;
         }
-        
+
         .logout a {
             color: #ff6b6b;
             text-decoration: none;
         }
-        
+
         .logout a:hover {
             text-decoration: underline;
         }
-        
+
         .delete-link {
             color: #ff6b6b;
             text-decoration: none;
             margin-left: 10px;
         }
-        
+
         .delete-link:hover {
             text-decoration: underline;
         }
-        
+
         /* 编辑按钮样式 */
         .edit-link {
             color: #1a73e8;
             text-decoration: none;
             margin-left: 10px;
         }
-        
+
         .edit-link:hover {
             text-decoration: underline;
         }
-        
+
         /* 重命名按钮样式 */
         .rename-link {
             color: #8ab4f8;
             text-decoration: none;
             margin-left: 10px;
         }
-        
+
         .rename-link:hover {
             text-decoration: underline;
         }
@@ -1888,65 +2105,65 @@ if ($isAuthenticated) {
             text-decoration: none;
             margin-left: 10px;
         }
-        
+
         .ungzip-link:hover {
             text-decoration: underline;
         }
-        
+
         /* 批量上传按钮 */
         .batch-upload-btn {
             background-color: #34d399;
             margin-left: 10px;
         }
-        
+
         .batch-upload-btn:hover {
             background-color: #10b981;
         }
-        
+
         /* 全页面拖放高亮效果 */
         body.drag-over {
             background-color: rgba(26, 115, 232, 0.1);
             transition: background-color 0.3s ease;
         }
-        
+
         /* 路径导航 */
         .path-nav {
             margin-bottom: 20px;
             font-size: 16px;
         }
-        
+
         .path-nav a {
             color: #8ab4f8;
             text-decoration: none;
         }
-        
+
         .path-nav a:hover {
             text-decoration: underline;
         }
-        
+
         .path-separator {
             color: #666;
             margin: 0 5px;
         }
-        
+
         /* 创建文件夹表单样式 */
         .create-folder-form {
             display: flex;
             gap: 10px;
             align-items: flex-end;
         }
-        
+
         .create-folder-form .form-group {
             flex: 1;
             margin-bottom: 0;
         }
-        
+
         /* 上传进度指示器 */
         .upload-progress {
             margin-top: 15px;
             display: none;
         }
-        
+
         .progress-bar {
             width: 100%;
             height: 20px;
@@ -1954,14 +2171,14 @@ if ($isAuthenticated) {
             border-radius: 10px;
             overflow: hidden;
         }
-        
+
         .progress-fill {
             height: 100%;
             background-color: #1a73e8;
             width: 0;
             transition: width 0.3s ease;
         }
-        
+
         .upload-stats {
             margin-top: 5px;
             font-size: 14px;
@@ -1969,6 +2186,7 @@ if ($isAuthenticated) {
         }
     </style>
 </head>
+
 <body>
     <!-- 页面加载蒙板 -->
     <div id="loadingMask" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(18, 18, 18, 0.8); display: flex; align-items: center; justify-content: center; z-index: 9999; flex-direction: column;">
@@ -1977,26 +2195,26 @@ if ($isAuthenticated) {
         </div>
         <div style="font-size: 18px; color: #e0e0e0;">页面加载中，请稍候...</div>
     </div>
-    
+
     <div class="container">
         <h1><i class="fas fa-cloud-upload-alt mr-2"></i>文件管理器</h1>
 
         <?php if ($error): ?>
-            <div class="error"><i class="fas fa-exclamation-circle mr-2"></i><?php echo $error; ?></div>
+            <div class="error notice-box"><i class="fas fa-exclamation-circle mr-2"></i><?php echo $error; ?></div>
         <?php endif; ?>
 
         <?php if ($success): ?>
-            <div class="success"><i class="fas fa-check-circle mr-2"></i><?php echo $success; ?></div>
+            <div class="success notice-box"><i class="fas fa-check-circle mr-2"></i><?php echo $success; ?></div>
         <?php endif; ?>
-        
+
         <?php if ($isAuthenticated): ?>
             <!-- 已登录用户可以看到的内容 -->
             <div class="logout">
                 <a href="#" onclick="openAdminModal()"><i class="fas fa-user mr-1"></i>管理员信息</a>
             </div>
-            
 
-            
+
+
             <!-- 管理员信息浮窗 -->
             <div id="adminModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.7); z-index: 1000;">
                 <div style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background-color: #252525; border: 1px solid #444; border-radius: 8px; padding: 30px; width: 500px; max-width: 90%; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);">
@@ -2005,7 +2223,7 @@ if ($isAuthenticated) {
                         <h2 style="color: #e0e0e0; margin: 0;"><i class="fas fa-user mr-2"></i>管理员信息</h2>
                         <button onclick="closeAdminModal()" style="background: none; border: none; color: #e0e0e0; font-size: 24px; cursor: pointer; padding: 0; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;">&times;</button>
                     </div>
-                    
+
                     <!-- 浮窗内容 -->
                     <div id="adminModalContent">
                         <!-- 修改密码表单 -->
@@ -2032,7 +2250,7 @@ if ($isAuthenticated) {
                                 </div>
                             </form>
                         </div>
-                        
+
                         <!-- 退出登录按钮 -->
                         <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
                             <a href="<?php echo $currentFile; ?>?logout=true" onclick="return confirm('确定要退出登录吗？');" style="background-color: #ff6b6b; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center;">
@@ -2050,23 +2268,23 @@ if ($isAuthenticated) {
                 </div>
                 <div id="uploadStats" class="upload-stats">准备上传...</div>
             </div>
-            
+
             <!-- 隐藏的文件选择输入 -->
             <input type="file" id="fileInput" multiple style="display: none;">
             <!-- 隐藏的文件夹选择输入 -->
             <input type="file" id="folderInput" webkitdirectory directory style="display: none;">
-            
+
             <h2>文件和文件夹</h2>
-            
+
             <!-- 路径导航 -->
             <div class="path-nav">
                 <a href="<?php echo $currentFile; ?>"><i class="fas fa-home mr-1"></i>根目录</a>
                 <?php if (!empty($currentPath)): ?>
-                    <?php 
-                        $pathParts = explode('/', $currentPath);
-                        $currentBuild = '';
-                        foreach ($pathParts as $part):
-                            $currentBuild .= '/' . $part;
+                    <?php
+                    $pathParts = explode('/', $currentPath);
+                    $currentBuild = '';
+                    foreach ($pathParts as $part):
+                        $currentBuild .= '/' . $part;
                     ?>
                         <span class="path-separator">/</span>
                         <a href="<?php echo $currentFile; ?>?path=<?php echo urlencode(substr($currentBuild, 1)); ?>">
@@ -2075,35 +2293,35 @@ if ($isAuthenticated) {
                     <?php endforeach; ?>
                 <?php endif; ?>
             </div>
-            
+
             <!-- 操作栏容器 - 批量操作和新建功能在同一行 -->
-            <div class="action-bar" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; gap: 15px; width: 100%;">
+            <div class="action-bar" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; gap: 15px; width: 100%; flex-wrap: wrap;">
                 <!-- 批量操作容器 -->
                 <?php if (count($items) > 0): ?>
                     <div id="batchActions" class="batch-actions" style="display: none; align-items: center; gap: 8px; flex-shrink: 0;">
-                        <button id="copySelected" class="batch-copy-btn" style="background-color: #60a5fa; padding: 8px 12px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
+                        <button id="copySelected" class="batch-copy-btn" style="background-color: #60a5fa; padding: 8px 12px; font-size: 14px; height: 36px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
                             <i class="fas fa-copy mr-1"></i>复制
                         </button>
-                        <button id="moveSelected" class="batch-move-btn" style="background-color: #f472b6; padding: 8px 12px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
+                        <button id="moveSelected" class="batch-move-btn" style="background-color: #f472b6; padding: 8px 12px; font-size: 14px; height: 36px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
                             <i class="fas fa-cut mr-1"></i>移动
                         </button>
-                        <button id="compressSelected" class="batch-compress-btn" style="background-color: #4caf50; padding: 8px 12px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
+                        <button id="compressSelected" class="batch-compress-btn" style="background-color: #4caf50; padding: 8px 12px; font-size: 14px; height: 36px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
                             <i class="fas fa-file-archive mr-1"></i>压缩
                         </button>
-                        <button id="deleteSelected" class="batch-delete-btn" style="background-color: #ff6b6b; padding: 8px 12px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
+                        <button id="deleteSelected" class="batch-delete-btn" style="background-color: #ff6b6b; padding: 8px 12px; font-size: 14px; height: 36px; border: none; border-radius: 4px; cursor: pointer; color: white; min-width: 80px;">
                             <i class="fas fa-trash-alt mr-1"></i>删除
                         </button>
                         <span id="selectedCount" style="font-size: 14px; color: #e0e0e0;">已选择 0 个项目</span>
                     </div>
                 <?php endif; ?>
-                
+
                 <!-- 新建功能容器 -->
                 <div class="create-container" style="display: flex; align-items: center; gap: 15px; flex-shrink: 0;">
                     <!-- 上传文件按钮 -->
                     <button type="button" onclick="document.getElementById('fileInput').click()" class="inline-button" style="padding: 8px 16px; font-size: 14px; background-color: #34d399; border: none; border-radius: 4px; cursor: pointer; color: white; display: flex; align-items: center; gap: 5px;">
                         <i class="fas fa-file-upload mr-1"></i>上传文件
                     </button>
-                    
+
                     <!-- 上传文件夹按钮 -->
                     <button type="button" onclick="document.getElementById('folderInput').click()" class="inline-button" style="padding: 8px 16px; font-size: 14px; background-color: #f59e0b; border: none; border-radius: 4px; cursor: pointer; color: white; display: flex; align-items: center; gap: 5px;">
                         <i class="fas fa-arrow-up-from-bracket mr-1"></i>上传文件夹
@@ -2114,17 +2332,17 @@ if ($isAuthenticated) {
                         <input type="text" id="folder_name" name="folder_name" placeholder="文件夹名称" required class="inline-input" style="padding: 8px 12px; border: 1px solid #444; border-radius: 4px; background-color: #333; color: #e0e0e0;">
                         <button type="submit" name="create_folder" class="inline-button" style="padding: 8px 16px; font-size: 14px; background-color: #1a73e8; border: none; border-radius: 4px; cursor: pointer; color: white;"><i class="fas fa-plus mr-1"></i>创建</button>
                     </form>
-                    
+
                     <!-- 新建文件表单 -->
                     <form method="post" action="<?php echo $currentFile; ?><?php echo isset($_GET['path']) ? '?path=' . urlencode($_GET['path']) : ''; ?>" style="display: flex; align-items: center; gap: 8px;">
                         <label for="file_name" class="inline-label" style="font-size: 14px; color: #e0e0e0;"><i class="fas fa-file-alt mr-1"></i>新建文件</label>
                         <input type="text" id="file_name" name="file_name" placeholder="文件名" required class="inline-input" style="padding: 8px 12px; border: 1px solid #444; border-radius: 4px; background-color: #333; color: #e0e0e0;">
                         <button type="submit" name="create_file" class="inline-button" style="padding: 8px 16px; font-size: 14px; background-color: #1a73e8; border: none; border-radius: 4px; cursor: pointer; color: white;"><i class="fas fa-plus mr-1"></i>创建</button>
                     </form>
-                    
-                    </div>
+
+                </div>
             </div>
-            
+
             <?php if (count($items) > 0): ?>
                 <table class="file-list">
                     <thead>
@@ -2158,7 +2376,7 @@ if ($isAuthenticated) {
                                 </td>
                                 <td>
                                     <?php if ($item['type'] === 'folder'): ?>
-                                        - 
+                                        -
                                     <?php else: ?>
                                         <?php echo formatFileSize($item['size']); ?>
                                     <?php endif; ?>
@@ -2181,7 +2399,7 @@ if ($isAuthenticated) {
                                                 <i class="fas fa-edit mr-1"></i>编辑
                                             </a>
                                         <?php endif; ?>
-                                        
+
                                         <!-- 重命名按钮 -->
                                         <a href="<?php echo $currentFile; ?>?rename=<?php echo urlencode($item['path']); ?>&path=<?php echo urlencode($currentPath); ?>&type=file" class="rename-link">
                                             <i class="fas fa-edit mr-1"></i>重命名
@@ -2192,7 +2410,7 @@ if ($isAuthenticated) {
                                                 <i class="fas fa-expand-alt mr-1"></i>解压
                                             </a>
                                         <?php endif; ?>
-                                        
+
                                         <!-- 删除按钮 -->
                                         <a href="<?php echo $currentFile; ?>?delete=<?php echo urlencode($item['path']); ?>&path=<?php echo urlencode($currentPath); ?>" class="delete-link" onclick="return confirm('确定要删除文件 &quot;<?php echo htmlspecialchars($item['name']); ?>&quot; 吗？删除后无法恢复。');">
                                             <i class="fas fa-trash-alt mr-1"></i>删除
@@ -2207,7 +2425,8 @@ if ($isAuthenticated) {
                 <p>当前目录为空</p>
             <?php endif; ?>
         <?php else:
-            // 未登录用户看到的密码表单 ?>
+            // 未登录用户看到的密码表单 
+        ?>
             <div class="password-form">
                 <h2><i class="fas fa-lock mr-2"></i>请输入访问密码</h2>
                 <form method="post">
@@ -2220,7 +2439,7 @@ if ($isAuthenticated) {
             </div>
         <?php endif; ?>
     </div>
-    
+
     <script>
         // 页面加载完成后隐藏蒙板
         window.addEventListener('load', function() {
@@ -2229,24 +2448,24 @@ if ($isAuthenticated) {
                 // 添加淡出效果
                 loadingMask.style.transition = 'opacity 0.5s ease';
                 loadingMask.style.opacity = '0';
-                
+
                 // 延迟后完全隐藏
                 setTimeout(function() {
                     loadingMask.style.display = 'none';
                 }, 500);
             }
         });
-        
+
         // 打开管理员信息浮窗
         function openAdminModal() {
             document.getElementById('adminModal').style.display = 'block';
         }
-        
+
         // 关闭管理员信息浮窗
         function closeAdminModal() {
             document.getElementById('adminModal').style.display = 'none';
         }
-        
+
         // 点击浮窗外围关闭浮窗
         window.onclick = function(event) {
             const modal = document.getElementById('adminModal');
@@ -2254,7 +2473,7 @@ if ($isAuthenticated) {
                 closeAdminModal();
             }
         }
-        
+
         document.addEventListener('DOMContentLoaded', function() {
             // 批量操作相关元素
             const selectAllCheckbox = document.getElementById('selectAll');
@@ -2265,50 +2484,50 @@ if ($isAuthenticated) {
             const moveSelectedBtn = document.getElementById('moveSelected');
             const copySelectedBtn = document.getElementById('copySelected');
             const selectedCountSpan = document.getElementById('selectedCount');
-            
+
             // 拖放上传相关元素
             const uploadProgress = document.getElementById('uploadProgress');
             const progressFill = document.getElementById('progressFill');
             const uploadStats = document.getElementById('uploadStats');
             const fileInput = document.getElementById('fileInput');
             const folderInput = document.getElementById('folderInput');
-            
+
             // 初始化批量操作相关事件
             if (selectAllCheckbox) {
                 selectAllCheckbox.addEventListener('change', toggleSelectAll);
             }
-            
+
             if (itemCheckboxes.length > 0) {
                 itemCheckboxes.forEach(checkbox => {
                     checkbox.addEventListener('change', updateSelectedCount);
                 });
             }
-            
+
             if (deleteSelectedBtn) {
                 deleteSelectedBtn.addEventListener('click', handleBatchDelete);
             }
-            
+
             if (compressSelectedBtn) {
                 compressSelectedBtn.addEventListener('click', handleBatchCompress);
             }
-            
+
             if (moveSelectedBtn) {
                 moveSelectedBtn.addEventListener('click', function() {
                     handleBatchMoveOrCopy('move');
                 });
             }
-            
+
             if (copySelectedBtn) {
                 copySelectedBtn.addEventListener('click', function() {
                     handleBatchMoveOrCopy('copy');
                 });
             }
-            
+
             // 更新选中项目计数
             function updateSelectedCount() {
                 const selectedCount = document.querySelectorAll('.item-checkbox:checked').length;
                 selectedCountSpan.textContent = `已选择 ${selectedCount} 个项目`;
-                
+
                 if (selectedCount > 0) {
                     batchActions.style.display = 'block';
                     // 隐藏新建容器
@@ -2326,7 +2545,7 @@ if ($isAuthenticated) {
                     }
                 }
             }
-            
+
             // 全选/取消全选
             function toggleSelectAll() {
                 const isChecked = selectAllCheckbox.checked;
@@ -2335,17 +2554,17 @@ if ($isAuthenticated) {
                 });
                 updateSelectedCount();
             }
-            
+
             // 处理批量删除
             function handleBatchDelete() {
                 const selectedItems = document.querySelectorAll('.item-checkbox:checked');
                 const selectedCount = selectedItems.length;
-                
+
                 if (selectedCount === 0) {
                     alert('请先选择要删除的项目');
                     return;
                 }
-                
+
                 if (confirm(`确定要删除选中的 ${selectedCount} 个项目吗？删除后无法恢复。`)) {
                     // 收集选中项目的路径和类型
                     const selectedPaths = new Array();
@@ -2355,12 +2574,12 @@ if ($isAuthenticated) {
                             path: checkbox.dataset.path
                         });
                     });
-                    
+
                     // 创建表单并提交
                     const form = document.createElement('form');
                     form.method = 'post';
                     form.action = '<?php echo $currentFile; ?>';
-                    
+
                     // 添加路径数据
                     selectedPaths.forEach((item, index) => {
                         const typeInput = document.createElement('input');
@@ -2368,14 +2587,14 @@ if ($isAuthenticated) {
                         typeInput.name = `selected_items[${index}][type]`;
                         typeInput.value = item.type;
                         form.appendChild(typeInput);
-                        
+
                         const pathInput = document.createElement('input');
                         pathInput.type = 'hidden';
                         pathInput.name = `selected_items[${index}][path]`;
                         pathInput.value = item.path;
                         form.appendChild(pathInput);
                     });
-                    
+
                     // 添加当前路径
                     const currentPath = new URLSearchParams(window.location.search).get('path') || '';
                     const currentPathInput = document.createElement('input');
@@ -2383,30 +2602,30 @@ if ($isAuthenticated) {
                     currentPathInput.name = 'current_path';
                     currentPathInput.value = currentPath;
                     form.appendChild(currentPathInput);
-                    
+
                     // 添加操作类型
                     const actionInput = document.createElement('input');
                     actionInput.type = 'hidden';
                     actionInput.name = 'batch_action';
                     actionInput.value = 'delete';
                     form.appendChild(actionInput);
-                    
+
                     // 提交表单
                     document.body.appendChild(form);
                     form.submit();
                 }
             }
-            
+
             // 处理批量压缩
             function handleBatchCompress() {
                 const selectedItems = document.querySelectorAll('.item-checkbox:checked');
                 const selectedCount = selectedItems.length;
-                
+
                 if (selectedCount === 0) {
                     alert('请先选择要压缩的项目');
                     return;
                 }
-                
+
                 if (confirm(`确定要将选中的 ${selectedCount} 个项目（支持文件和文件夹）批量压缩为GZ文件并下载吗？`)) {
                     // 收集选中项目的路径和类型
                     const selectedPaths = new Array();
@@ -2416,13 +2635,13 @@ if ($isAuthenticated) {
                             path: checkbox.dataset.path
                         });
                     });
-                    
+
                     // 创建表单并提交
                     const form = document.createElement('form');
                     form.method = 'post';
                     form.action = '<?php echo $currentFile; ?>';
                     form.target = '_blank'; // 在新窗口打开，方便下载
-                    
+
                     // 添加路径数据
                     selectedPaths.forEach((item, index) => {
                         const typeInput = document.createElement('input');
@@ -2430,14 +2649,14 @@ if ($isAuthenticated) {
                         typeInput.name = `selected_items[${index}][type]`;
                         typeInput.value = item.type;
                         form.appendChild(typeInput);
-                        
+
                         const pathInput = document.createElement('input');
                         pathInput.type = 'hidden';
                         pathInput.name = `selected_items[${index}][path]`;
                         pathInput.value = item.path;
                         form.appendChild(pathInput);
                     });
-                    
+
                     // 添加当前路径
                     const currentPath = new URLSearchParams(window.location.search).get('path') || '';
                     const currentPathInput = document.createElement('input');
@@ -2445,31 +2664,31 @@ if ($isAuthenticated) {
                     currentPathInput.name = 'current_path';
                     currentPathInput.value = currentPath;
                     form.appendChild(currentPathInput);
-                    
+
                     // 添加操作类型
                     const actionInput = document.createElement('input');
                     actionInput.type = 'hidden';
                     actionInput.name = 'batch_action';
                     actionInput.value = 'compress';
                     form.appendChild(actionInput);
-                    
+
                     // 提交表单
                     document.body.appendChild(form);
                     form.submit();
                     document.body.removeChild(form);
                 }
             }
-            
+
             // 处理批量移动或复制
             function handleBatchMoveOrCopy(actionType) {
                 const selectedItems = document.querySelectorAll('.item-checkbox:checked');
                 const selectedCount = selectedItems.length;
-                
+
                 if (selectedCount === 0) {
                     alert(`请先选择要${actionType === 'move' ? '移动' : '复制'}的项目`);
                     return;
                 }
-                
+
                 // 创建加载对话框
                 const loadingDialog = document.createElement('div');
                 loadingDialog.style.cssText = `
@@ -2486,7 +2705,7 @@ if ($isAuthenticated) {
                     text-align: center;
                     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
                 `;
-                
+
                 const loadingMessage = document.createElement('p');
                 loadingMessage.textContent = '正在加载文件夹列表...';
                 loadingMessage.style.cssText = `
@@ -2494,7 +2713,7 @@ if ($isAuthenticated) {
                     margin: 0;
                 `;
                 loadingDialog.appendChild(loadingMessage);
-                
+
                 const overlay = document.createElement('div');
                 overlay.style.cssText = `
                     position: fixed;
@@ -2505,17 +2724,17 @@ if ($isAuthenticated) {
                     background-color: rgba(0, 0, 0, 0.7);
                     z-index: 999;
                 `;
-                
+
                 document.body.appendChild(overlay);
                 document.body.appendChild(loadingDialog);
-                
+
                 // 从服务器获取所有文件夹
                 fetch('<?php echo $currentFile; ?>?get_folders=1')
                     .then(response => response.json())
                     .then(folders => {
                         // 移除加载对话框
                         document.body.removeChild(loadingDialog);
-                        
+
                         // 创建目标文件夹选择对话框
                         const dialog = document.createElement('div');
                         dialog.style.cssText = `
@@ -2532,7 +2751,7 @@ if ($isAuthenticated) {
                             max-width: 90%;
                             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
                         `;
-                        
+
                         const title = document.createElement('h3');
                         title.textContent = `${actionType === 'move' ? '批量移动' : '批量复制'}项目`;
                         title.style.cssText = `
@@ -2542,7 +2761,7 @@ if ($isAuthenticated) {
                             font-size: 18px;
                         `;
                         dialog.appendChild(title);
-                        
+
                         const message = document.createElement('p');
                         message.textContent = `请选择目标文件夹，将选中的 ${selectedCount} 个项目${actionType === 'move' ? '移动' : '复制'}到该文件夹：`;
                         message.style.cssText = `
@@ -2550,12 +2769,12 @@ if ($isAuthenticated) {
                             margin-bottom: 15px;
                         `;
                         dialog.appendChild(message);
-                        
+
                         const selectContainer = document.createElement('div');
                         selectContainer.style.cssText = `
                             margin-bottom: 20px;
                         `;
-                        
+
                         const selectLabel = document.createElement('label');
                         selectLabel.textContent = '目标文件夹：';
                         selectLabel.style.cssText = `
@@ -2565,7 +2784,7 @@ if ($isAuthenticated) {
                             font-weight: 600;
                         `;
                         selectContainer.appendChild(selectLabel);
-                        
+
                         const select = document.createElement('select');
                         select.id = 'batchTargetPath';
                         select.style.cssText = `
@@ -2577,30 +2796,30 @@ if ($isAuthenticated) {
                             color: #e0e0e0;
                             font-size: 16px;
                         `;
-                        
+
                         // 添加选项
                         const rootOption = document.createElement('option');
                         rootOption.value = '';
                         rootOption.textContent = '根目录';
                         select.appendChild(rootOption);
-                        
+
                         folders.forEach(folder => {
                             const option = document.createElement('option');
                             option.value = folder;
                             option.textContent = folder;
                             select.appendChild(option);
                         });
-                        
+
                         selectContainer.appendChild(select);
                         dialog.appendChild(selectContainer);
-                        
+
                         const buttonContainer = document.createElement('div');
                         buttonContainer.style.cssText = `
                             display: flex;
                             gap: 10px;
                             justify-content: flex-end;
                         `;
-                        
+
                         const cancelBtn = document.createElement('button');
                         cancelBtn.textContent = '取消';
                         cancelBtn.style.cssText = `
@@ -2617,7 +2836,7 @@ if ($isAuthenticated) {
                             document.body.removeChild(overlay);
                         });
                         buttonContainer.appendChild(cancelBtn);
-                        
+
                         const confirmBtn = document.createElement('button');
                         confirmBtn.textContent = actionType === 'move' ? '移动' : '复制';
                         confirmBtn.style.cssText = `
@@ -2631,12 +2850,12 @@ if ($isAuthenticated) {
                         `;
                         confirmBtn.addEventListener('click', () => {
                             const targetPath = select.value;
-                            
+
                             // 创建表单并提交
                             const form = document.createElement('form');
                             form.method = 'post';
                             form.action = '<?php echo $currentFile; ?>';
-                            
+
                             // 收集选中项目的路径和类型
                             const selectedPaths = new Array();
                             selectedItems.forEach(checkbox => {
@@ -2645,7 +2864,7 @@ if ($isAuthenticated) {
                                     path: checkbox.dataset.path
                                 });
                             });
-                            
+
                             // 添加路径数据
                             selectedPaths.forEach((item, index) => {
                                 const typeInput = document.createElement('input');
@@ -2653,14 +2872,14 @@ if ($isAuthenticated) {
                                 typeInput.name = `selected_items[${index}][type]`;
                                 typeInput.value = item.type;
                                 form.appendChild(typeInput);
-                                
+
                                 const pathInput = document.createElement('input');
                                 pathInput.type = 'hidden';
                                 pathInput.name = `selected_items[${index}][path]`;
                                 pathInput.value = item.path;
                                 form.appendChild(pathInput);
                             });
-                            
+
                             // 添加当前路径
                             const currentPath = new URLSearchParams(window.location.search).get('path') || '';
                             const currentPathInput = document.createElement('input');
@@ -2668,94 +2887,94 @@ if ($isAuthenticated) {
                             currentPathInput.name = 'current_path';
                             currentPathInput.value = currentPath;
                             form.appendChild(currentPathInput);
-                            
+
                             // 添加目标路径
                             const targetPathInput = document.createElement('input');
                             targetPathInput.type = 'hidden';
                             targetPathInput.name = 'target_path';
                             targetPathInput.value = targetPath;
                             form.appendChild(targetPathInput);
-                            
+
                             // 添加操作类型
                             const actionInput = document.createElement('input');
                             actionInput.type = 'hidden';
                             actionInput.name = 'batch_action';
                             actionInput.value = actionType;
                             form.appendChild(actionInput);
-                            
+
                             // 提交表单
                             document.body.appendChild(form);
                             form.submit();
                             document.body.removeChild(form);
-                            
+
                             // 移除对话框
                             document.body.removeChild(dialog);
                             document.body.removeChild(overlay);
                         });
                         buttonContainer.appendChild(confirmBtn);
                         dialog.appendChild(buttonContainer);
-                        
+
                         document.body.appendChild(dialog);
                     })
                     .catch(error => {
                         // 移除加载对话框
                         document.body.removeChild(loadingDialog);
                         document.body.removeChild(overlay);
-                        
+
                         alert('加载文件夹列表失败，请重试');
                         console.error('Error loading folders:', error);
                     });
             }
-            
+
             // 阻止默认拖放行为
             ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
                 document.body.addEventListener(eventName, preventDefaults, false);
             });
-            
+
             // 添加全页面高亮效果
             ['dragenter', 'dragover'].forEach(eventName => {
                 document.body.addEventListener(eventName, highlightBody, false);
             });
-            
+
             ['dragleave', 'drop'].forEach(eventName => {
                 document.body.addEventListener(eventName, unhighlightBody, false);
             });
-            
+
             function preventDefaults(e) {
                 e.preventDefault();
                 e.stopPropagation();
             }
-            
+
             function highlightBody() {
                 document.body.classList.add('drag-over');
             }
-            
+
             function unhighlightBody() {
                 document.body.classList.remove('drag-over');
             }
-            
+
             // 处理放置事件
             document.body.addEventListener('drop', handleDrop, false);
-            
+
             // 处理文件选择
             fileInput.addEventListener('change', function() {
                 if (this.files.length > 0) {
                     uploadFiles(this.files);
                 }
             });
-            
+
             // 处理文件夹选择
             folderInput.addEventListener('change', function() {
                 if (this.files.length > 0) {
                     handleFolderSelection(this.files);
                 }
             });
-            
+
             function handleDrop(e) {
                 const dt = e.dataTransfer;
                 const files = dt.files;
                 const items = dt.items;
-                
+
                 // 检查是否拖放了文件夹
                 let isFolder = false;
                 for (let i = 0; i < items.length; i++) {
@@ -2768,7 +2987,7 @@ if ($isAuthenticated) {
                         }
                     }
                 }
-                
+
                 if (isFolder) {
                     // 处理文件夹拖放
                     handleFolderDrop(items);
@@ -2777,89 +2996,293 @@ if ($isAuthenticated) {
                     uploadFiles(files);
                 }
             }
-            
-            // 上传文件
+
+            // 分片上传配置
+            const CHUNK_SIZE = <?php echo $CONFIG['CHUNK_SIZE']; ?>; // 5MB
+            const MAX_CONCURRENT = <?php echo $CONFIG['MAX_CONCURRENT']; ?>; // 最大并发数
+            const MAX_UPLOAD_SIZE = <?php echo $CONFIG['MAX_UPLOAD_SIZE']; ?>; // 最大上传大小
+
+            // 检查是否需要分片上传
+            function needsChunkedUpload(file) {
+                const maxFileSize = <?php echo $CONFIG['MAX_FILE_SIZE']; ?>;
+                return file.size > maxFileSize;
+            }
+
+            // 检查文件是否超过最大限制
+            function exceedsMaxSize(file) {
+                return file.size > MAX_UPLOAD_SIZE;
+            }
+
+            // 格式化文件大小
+            function formatFileSize(bytes) {
+                if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
+                if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+                return bytes + ' B';
+            }
+
+            // 分片上传文件
+            function uploadFileWithChunks(file, targetFolder) {
+                return new Promise((resolve, reject) => {
+                    const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+                    const uploadedChunks = new Set();
+                    let activeUploads = 0;
+
+                    uploadProgress.style.display = 'block';
+                    progressFill.style.width = '0%';
+                    uploadStats.textContent = `准备上传：${file.name} (${formatFileSize(file.size)})`;
+
+                    // 上传单个分片
+                    function uploadChunk(chunkIndex) {
+                        if (uploadedChunks.has(chunkIndex)) return Promise.resolve();
+
+                        const start = chunkIndex * CHUNK_SIZE;
+                        const end = Math.min(start + CHUNK_SIZE, file.size);
+                        const chunk = file.slice(start, end);
+
+                        const formData = new FormData();
+                        formData.append('chunk_upload', '1');
+                        formData.append('file_id', fileId);
+                        formData.append('chunk_index', chunkIndex);
+                        formData.append('total_chunks', totalChunks);
+                        formData.append('file_name', file.name);
+                        formData.append('file_size', file.size);
+                        formData.append('chunk_data', chunk);
+                        if (targetFolder) {
+                            formData.append('current_path', targetFolder);
+                        }
+
+                        activeUploads++;
+
+                        return fetch('<?php echo $currentFile; ?>', {
+                                method: 'POST',
+                                body: formData
+                            })
+                            .then(async response => {
+                                const text = await response.text();
+                                try {
+                                    const data = JSON.parse(text);
+                                    activeUploads--;
+                                    if (data.success) {
+                                        uploadedChunks.add(chunkIndex);
+                                        const percentComplete = (uploadedChunks.size / totalChunks) * 100;
+                                        progressFill.style.width = percentComplete + '%';
+                                        uploadStats.textContent = `上传中：${uploadedChunks.size}/${totalChunks} 分片 (${Math.round(percentComplete)}%)`;
+                                    } else {
+                                        // 显示详细错误和调试信息
+                                        const debugInfo = data.debug ? JSON.stringify(data.debug) : '';
+                                        console.error('上传错误详情:', data.error, debugInfo);
+                                        uploadStats.textContent = `错误: ${data.error}`;
+                                        throw new Error(data.error || '分片上传失败');
+                                    }
+                                } catch (e) {
+                                    // JSON 解析失败，显示服务器返回的内容
+                                    console.error('服务器响应:', text.substring(0, 500));
+                                    console.error('解析错误:', e);
+                                    uploadStats.textContent = `服务器错误: ${e.message}`;
+                                    throw new Error('服务器响应错误: ' + (e.message || '未知错误'));
+                                }
+                            })
+                            .catch(error => {
+                                activeUploads--;
+                                console.error('分片上传失败:', chunkIndex, error);
+                                throw error;
+                            });
+                    }
+
+                    // 启动并发上传
+                    function startNextChunk() {
+                        // 找到下一个未上传的分片
+                        for (let i = 0; i < totalChunks; i++) {
+                            if (!uploadedChunks.has(i) && activeUploads < MAX_CONCURRENT) {
+                                uploadChunk(i).then(() => {
+                                    if (uploadedChunks.size < totalChunks) {
+                                        startNextChunk();
+                                    } else {
+                                        // 所有分片上传完成，请求合并
+                                        mergeChunks();
+                                    }
+                                }).catch(() => {
+                                    // 失败重试
+                                    setTimeout(() => startNextChunk(), 1000);
+                                });
+                                return;
+                            }
+                        }
+                    }
+
+                    // 合并分片
+                    function mergeChunks() {
+                        uploadStats.textContent = '正在合并文件...';
+
+                        const formData = new FormData();
+                        formData.append('chunk_merge', '1');
+                        formData.append('file_id', fileId);
+                        if (targetFolder) {
+                            formData.append('current_path', targetFolder);
+                        }
+
+                        fetch('<?php echo $currentFile; ?>', {
+                                method: 'POST',
+                                body: formData
+                            })
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.success) {
+                                    uploadStats.textContent = `上传完成：${data.file_name}`;
+                                    progressFill.style.width = '100%';
+                                    setTimeout(() => {
+                                        window.location.reload();
+                                    }, 1500);
+                                    resolve(data);
+                                } else {
+                                    throw new Error(data.error || '合并失败');
+                                }
+                            })
+                            .catch(error => {
+                                uploadStats.textContent = `合并失败：${error.message}`;
+                                reject(error);
+                            });
+                    }
+
+                    // 开始上传
+                    for (let i = 0; i < Math.min(MAX_CONCURRENT, totalChunks); i++) {
+                        startNextChunk();
+                    }
+                });
+            }
+
+            // 上传文件（支持分片上传）
             function uploadFiles(files) {
                 // 显示进度条
                 uploadProgress.style.display = 'block';
                 progressFill.style.width = '0%';
-                
+
                 const totalFiles = files.length;
-                let uploadedFiles = 0;
-                let failedFiles = 0;
-                
+                let processedFiles = 0;
+
                 // 获取当前路径作为目标文件夹
                 const currentPath = new URLSearchParams(window.location.search).get('path') || '';
-                
-                // 创建FormData并添加每个文件
-                const formData = new FormData();
-                for (let i = 0; i < files.length; i++) {
-                    formData.append('files[]', files[i]);
+
+                // 处理单个文件上传（普通上传）
+                function uploadSingleFile(file) {
+                    return new Promise((resolve, reject) => {
+                        const formData = new FormData();
+                        formData.append('files[]', file);
+                        if (currentPath) {
+                            formData.append('target_folder', currentPath);
+                        }
+
+                        const xhr = new XMLHttpRequest();
+
+                        xhr.upload.addEventListener('progress', function(e) {
+                            if (e.lengthComputable) {
+                                const percentComplete = (e.loaded / e.total) * 100;
+                                progressFill.style.width = percentComplete + '%';
+                                uploadStats.textContent = `正在上传：${file.name} (${Math.round(percentComplete)}%)`;
+                            }
+                        });
+
+                        xhr.addEventListener('load', function() {
+                            resolve();
+                        });
+
+                        xhr.addEventListener('error', function() {
+                            reject(new Error('上传失败'));
+                        });
+
+                        xhr.open('POST', '<?php echo $currentFile; ?>');
+                        xhr.send(formData);
+                    });
                 }
-                if (currentPath) {
-                    formData.append('target_folder', currentPath);
-                }
-                
-                // 创建AJAX请求
-                const xhr = new XMLHttpRequest();
-                
-                xhr.upload.addEventListener('progress', function(e) {
-                    if (e.lengthComputable) {
-                        const percentComplete = (e.loaded / e.total) * 100;
-                        progressFill.style.width = percentComplete + '%';
-                        uploadStats.textContent = `正在上传：${Math.round(percentComplete)}%`;
+
+                // 顺序处理每个文件
+                function processNextFile() {
+                    if (processedFiles >= totalFiles) {
+                        uploadStats.textContent = '上传完成！';
+                        setTimeout(() => window.location.reload(), 1000);
+                        return;
                     }
-                });
-                
-                xhr.addEventListener('load', function() {
-                    uploadStats.textContent = '上传完成！';
-                    // 延迟后刷新页面
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 1000);
-                });
-                
-                xhr.addEventListener('error', function() {
-                    uploadStats.textContent = '上传出错！';
-                });
-                
-                xhr.open('POST', '<?php echo $currentFile; ?>');
-                xhr.send(formData);
+
+                    const file = files[processedFiles];
+
+                    // 检查文件是否超过最大限制
+                    if (exceedsMaxSize(file)) {
+                        uploadStats.textContent = `跳过：${file.name}（超过最大限制 ${formatFileSize(MAX_UPLOAD_SIZE)}）`;
+                        processedFiles++;
+                        setTimeout(processNextFile, 500);
+                        return;
+                    }
+
+                    // 判断是否需要分片上传
+                    if (needsChunkedUpload(file)) {
+                        // 使用分片上传
+                        uploadFileWithChunks(file, currentPath)
+                            .then(() => {
+                                processedFiles++;
+                                processNextFile();
+                            })
+                            .catch(error => {
+                                uploadStats.textContent = `上传失败：${file.name} - ${error.message}`;
+                                processedFiles++;
+                                setTimeout(processNextFile, 2000);
+                            });
+                    } else {
+                        // 使用普通上传
+                        uploadStats.textContent = `正在上传：${file.name}`;
+                        uploadSingleFile(file)
+                            .then(() => {
+                                processedFiles++;
+                                const percentComplete = (processedFiles / totalFiles) * 100;
+                                progressFill.style.width = percentComplete + '%';
+                                processNextFile();
+                            })
+                            .catch(error => {
+                                uploadStats.textContent = `上传失败：${file.name}`;
+                                processedFiles++;
+                                setTimeout(processNextFile, 2000);
+                            });
+                    }
+                }
+
+                // 开始处理第一个文件
+                processNextFile();
             }
-            
+
             // 处理文件夹拖放
             function handleFolderDrop(items) {
                 const entries = new Array();
-                
+
                 // 显示进度条
                 uploadProgress.style.display = 'block';
                 progressFill.style.width = '0%';
                 uploadStats.textContent = '正在准备上传文件夹...';
-                
+
                 // 收集所有文件条目，包括文件夹
-            for (let i = 0; i < items.length; i++) {
-                const item = items[i];
-                if (item.webkitGetAsEntry) {
-                    const entry = item.webkitGetAsEntry();
-                    entries.push(entry);
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.webkitGetAsEntry) {
+                        const entry = item.webkitGetAsEntry();
+                        entries.push(entry);
+                    }
                 }
-            }
-                
+
                 // 递归读取文件夹内容
                 const allFiles = new Array();
                 let totalFiles = 0;
                 let processedFiles = 0;
-                
+
                 function readDirectory(entry, path = '') {
                     const dirReader = entry.createReader();
-                    
+
                     function readEntries() {
                         dirReader.readEntries(function(entries) {
                             if (entries.length > 0) {
                                 for (let i = 0; i < entries.length; i++) {
                                     const entry = entries[i];
                                     const entryPath = path + '/' + entry.name;
-                                    
+
                                     if (entry.isDirectory) {
                                         readDirectory(entry, entryPath);
                                     } else {
@@ -2869,7 +3292,7 @@ if ($isAuthenticated) {
                                             file.relativePath = entryPath.startsWith('/') ? entryPath.substring(1) : entryPath;
                                             allFiles.push(file);
                                             processedFiles++;
-                                            
+
                                             if (processedFiles === totalFiles) {
                                                 // 所有文件都已收集，开始上传
                                                 uploadFolderFiles(allFiles);
@@ -2877,17 +3300,17 @@ if ($isAuthenticated) {
                                         });
                                     }
                                 }
-                                
+
                                 // 继续读取下一批条目
                                 readEntries();
                             }
                         });
                     }
-                    
+
                     // 开始读取条目
                     readEntries();
                 }
-                
+
                 // 开始读取每个条目
                 for (let i = 0; i < entries.length; i++) {
                     const entry = entries[i];
@@ -2899,7 +3322,7 @@ if ($isAuthenticated) {
                             file.relativePath = file.name;
                             allFiles.push(file);
                             processedFiles++;
-                            
+
                             if (processedFiles === totalFiles) {
                                 // 所有文件都已收集，开始上传
                                 uploadFolderFiles(allFiles);
@@ -2908,131 +3331,132 @@ if ($isAuthenticated) {
                     }
                 }
             }
-            
+
             // 上传文件夹中的文件
             function uploadFolderFiles(files) {
                 const totalFiles = files.length;
                 let uploadedFiles = 0;
-                
+
                 uploadStats.textContent = `正在上传：0/${totalFiles} 个文件`;
-                
+
                 // 获取当前URL中的path参数
                 const urlParams = new URLSearchParams(window.location.search);
                 const currentPath = urlParams.get('path') || '';
                 const currentFile = '<?php echo $currentFile; ?>';
                 const uploadUrl = currentPath ? `${currentFile}?path=${encodeURIComponent(currentPath)}` : currentFile;
-                
+
                 function uploadNextFile() {
                     if (uploadedFiles >= totalFiles) {
                         // 所有文件上传完成
                         uploadStats.textContent = `上传完成：${totalFiles}/${totalFiles} 个文件`;
                         progressFill.style.width = '100%';
-                        
+
                         // 延迟后刷新页面
                         setTimeout(() => {
                             window.location.reload();
                         }, 1000);
                         return;
                     }
-                    
+
                     const file = files[uploadedFiles];
                     const formData = new FormData();
                     formData.append('folder_file', file);
                     formData.append('relative_path', file.relativePath);
-                    
+
                     const xhr = new XMLHttpRequest();
-                    
+
                     xhr.addEventListener('load', function() {
                         uploadedFiles++;
                         const percentComplete = (uploadedFiles / totalFiles) * 100;
                         progressFill.style.width = percentComplete + '%';
                         uploadStats.textContent = `正在上传：${uploadedFiles}/${totalFiles} 个文件`;
-                        
+
                         // 上传下一个文件
                         uploadNextFile();
                     });
-                    
+
                     xhr.addEventListener('error', function() {
                         uploadedFiles++;
                         uploadStats.textContent = `上传出错：${file.relativePath}`;
-                        
+
                         // 继续上传下一个文件
                         setTimeout(uploadNextFile, 100);
                     });
-                    
+
                     xhr.open('POST', uploadUrl);
                     xhr.send(formData);
                 }
-                
+
                 // 开始上传第一个文件
                 uploadNextFile();
             }
-            
+
             // 处理文件夹选择
             function handleFolderSelection(files) {
                 // 显示进度条
                 uploadProgress.style.display = 'block';
                 progressFill.style.width = '0%';
-                
+
                 const totalFiles = files.length;
                 let uploadedFiles = 0;
-                
+
                 uploadStats.textContent = `正在上传：0/${totalFiles} 个文件`;
-                
+
                 // 获取当前URL中的path参数
                 const urlParams = new URLSearchParams(window.location.search);
                 const currentPath = urlParams.get('path') || '';
                 const currentFile = '<?php echo $currentFile; ?>';
                 const uploadUrl = currentPath ? `${currentFile}?path=${encodeURIComponent(currentPath)}` : currentFile;
-                
+
                 function uploadNextFile() {
                     if (uploadedFiles >= totalFiles) {
                         // 所有文件上传完成
                         uploadStats.textContent = `上传完成：${totalFiles}/${totalFiles} 个文件`;
                         progressFill.style.width = '100%';
-                        
+
                         // 延迟后刷新页面
                         setTimeout(() => {
                             window.location.reload();
                         }, 1000);
                         return;
                     }
-                    
+
                     const file = files[uploadedFiles];
                     const formData = new FormData();
                     formData.append('folder_file', file);
                     // 从webkitRelativePath获取相对路径
                     const relativePath = file.webkitRelativePath || file.name;
                     formData.append('relative_path', relativePath);
-                    
+
                     const xhr = new XMLHttpRequest();
-                    
+
                     xhr.addEventListener('load', function() {
                         uploadedFiles++;
                         const percentComplete = (uploadedFiles / totalFiles) * 100;
                         progressFill.style.width = percentComplete + '%';
                         uploadStats.textContent = `正在上传：${uploadedFiles}/${totalFiles} 个文件`;
-                        
+
                         // 上传下一个文件
                         uploadNextFile();
                     });
-                    
+
                     xhr.addEventListener('error', function() {
                         uploadedFiles++;
                         uploadStats.textContent = `上传出错：${relativePath}`;
-                        
+
                         // 继续上传下一个文件
                         setTimeout(uploadNextFile, 100);
                     });
-                    
+
                     xhr.open('POST', uploadUrl);
                     xhr.send(formData);
                 }
-                
+
                 // 开始上传第一个文件
                 uploadNextFile();
             }
         });
     </script>
 </body>
+
 </html>
