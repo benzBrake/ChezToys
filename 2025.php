@@ -1162,9 +1162,9 @@ if ($isAuthenticated) {
         // 安全处理文件名
         $fileNameToUngzip = sanitizePath($fileNameToUngzip, true);
 
-        // 检查文件是否以.gz结尾
-        if (substr($fileNameToUngzip, -3) !== '.gz') {
-            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('无效的压缩文件格式，仅支持.gz文件'));
+        // 检查文件是否以.gz或.tgz结尾
+        if (substr($fileNameToUngzip, -3) !== '.gz' && substr($fileNameToUngzip, -4) !== '.tgz') {
+            header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('无效的压缩文件格式，仅支持.gz或.tgz文件'));
             exit();
         }
 
@@ -1200,13 +1200,17 @@ if ($isAuthenticated) {
                 exit();
             }
 
-            // 检查是否为tar.gz文件
-            $isTarGz = substr($fileNameToUngzip, -7) === '.tar.gz';
+            // 检查是否为tar.gz或.tgz文件
+            $isTarGz = substr($fileNameToUngzip, -7) === '.tar.gz' || substr($fileNameToUngzip, -4) === '.tgz';
             $successMessage = '';
 
             if ($isTarGz) {
-                // 处理tar.gz文件
-                $tarFileName = substr($fileToUngzip, 0, -3);
+                // 处理tar.gz或.tgz文件
+                if (substr($fileNameToUngzip, -4) === '.tgz') {
+                    $tarFileName = substr($fileToUngzip, 0, -4) . '.tar';
+                } else {
+                    $tarFileName = substr($fileToUngzip, 0, -3);
+                }
 
                 // 写入tar文件
                 if (file_put_contents($tarFileName, $ungzippedContent)) {
@@ -1218,7 +1222,7 @@ if ($isAuthenticated) {
                     unlink($tarFileName);
 
                     if ($extractedFiles) {
-                        $successMessage = 'Tar.gz文件已成功解压，共解压 ' . count($extractedFiles) . ' 个文件';
+                        $successMessage = '压缩文件已成功解压，共解压 ' . count($extractedFiles) . ' 个文件';
                     } else {
                         header('Location: ' . $currentFile . '?path=' . urlencode($currentPath) . '&error=' . urlencode('解压tar文件失败'));
                         exit();
@@ -2436,7 +2440,7 @@ if ($isAuthenticated) {
                                             <i class="fas fa-edit mr-1"></i>重命名
                                         </a>
                                         <!-- 解压按钮 -->
-                                        <?php if (substr($item['name'], -3) === '.gz'): ?>
+                                        <?php if (substr($item['name'], -3) === '.gz' || substr($item['name'], -4) === '.tgz'): ?>
                                             <a href="<?php echo $currentFile; ?>?ungzip=<?php echo urlencode($item['path']); ?>&path=<?php echo urlencode($currentPath); ?>" class="ungzip-link" onclick="return confirm('确定要解压文件 &quot;<?php echo htmlspecialchars($item['name']); ?>&quot; 吗？');">
                                                 <i class="fas fa-expand-alt mr-1"></i>解压
                                             </a>
