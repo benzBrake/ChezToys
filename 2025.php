@@ -154,28 +154,71 @@ function getAuthLockPath()
     return dirname(__FILE__) . DIRECTORY_SEPARATOR . $CONFIG['AUTH_LOCK_FILE'];
 }
 
+// flock 在部分共享主机/NFS 文件系统上不可用，使用 mkdir 的原子性作为回退锁。
+function getAuthLockDirectory()
+{
+    return getAuthLockPath() . '.d';
+}
+
 function acquireAuthDataLock()
 {
     $handle = @fopen(getAuthLockPath(), 'a+b');
-    if (!$handle || !flock($handle, LOCK_EX)) {
-        if ($handle) {
-            fclose($handle);
+    if ($handle && function_exists('flock') && @flock($handle, LOCK_EX)) {
+        $stat = @fstat($handle);
+        if (!$stat || (int)$stat['size'] === 0) {
+            rewind($handle);
+            ftruncate($handle, 0);
+            fwrite($handle, "<?php exit; ?>\n");
+            fflush($handle);
+            @chmod(getAuthLockPath(), 0600);
         }
-        throw new Exception('无法锁定认证数据文件');
+        return array('type' => 'flock', 'handle' => $handle);
+    }
+    if ($handle) {
+        fclose($handle);
     }
 
-    if (filesize(getAuthLockPath()) === 0) {
-        fwrite($handle, "<?php exit; ?>\n");
-        fflush($handle);
-        @chmod(getAuthLockPath(), 0600);
+    // mkdir 是跨平台的原子操作。短暂重试以覆盖并发请求，过期锁可被清理。
+    $lockDirectory = getAuthLockDirectory();
+    $started = time();
+    while ((time() - $started) < 10) {
+        if (@mkdir($lockDirectory, 0700)) {
+            @file_put_contents($lockDirectory . DIRECTORY_SEPARATOR . 'owner', (string)getmypid());
+            return array('type' => 'mkdir', 'path' => $lockDirectory);
+        }
+        clearstatcache();
+        if (is_dir($lockDirectory) && @filemtime($lockDirectory) !== false &&
+            (time() - (int)@filemtime($lockDirectory)) > 60) {
+            @rmdir($lockDirectory);
+            continue;
+        }
+        usleep(100000);
     }
-    return $handle;
+    throw new Exception('无法锁定认证数据文件');
 }
 
-function releaseAuthDataLock($handle)
+function releaseAuthDataLock($lock)
 {
-    flock($handle, LOCK_UN);
-    fclose($handle);
+    if (is_array($lock) && isset($lock['type']) && $lock['type'] === 'mkdir') {
+        $owner = $lock['path'] . DIRECTORY_SEPARATOR . 'owner';
+        @unlink($owner);
+        @rmdir($lock['path']);
+        return;
+    }
+    if (is_array($lock) && isset($lock['handle'])) {
+        if (function_exists('flock')) {
+            @flock($lock['handle'], LOCK_UN);
+        }
+        fclose($lock['handle']);
+        return;
+    }
+    // 兼容旧调用方传入资源句柄。
+    if (is_resource($lock)) {
+        if (function_exists('flock')) {
+            @flock($lock, LOCK_UN);
+        }
+        fclose($lock);
+    }
 }
 
 function readAuthDataUnlocked()
@@ -653,6 +696,7 @@ function isProtectedRuntimePath($path)
     $name = mb_basename($normalized);
     return $name === $CONFIG['AUTH_DATA_FILE'] ||
         $name === $CONFIG['AUTH_LOCK_FILE'] ||
+        $name === mb_basename(str_replace('\\', '/', getAuthLockDirectory())) ||
         strpos($name, $CONFIG['AUTH_DATA_FILE'] . '.tmp.') === 0;
 }
 
