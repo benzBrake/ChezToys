@@ -6,9 +6,12 @@
  */
 // 配置参数
 $CONFIG = array(
-    'ACCESS_PASSWORD' => 'adminpassword2025', // 访问密码，请务必修改为强密码
+    'DEFAULT_PASSWORD' => 'adminpassword2025', // 首次运行默认密码，首次登录后必须修改
     'AUTH_COOKIE_NAME' => 'file_manager_auth', // 认证cookie名称
     'AUTH_COOKIE_EXPIRE' => 24 * 3600, // 认证cookie过期时间（24小时）
+    'AUTH_DATA_FILE' => '.2025-data.php', // 运行时认证数据文件
+    'AUTH_LOCK_FILE' => '.2025-data.lock.php', // 认证数据写锁
+    'MAX_AUTH_TOKENS' => 10, // 最多保留的有效登录Token数量
     'MAX_FILE_SIZE' => 2 * 1024 * 1024, // 最大文件大小默认值（2MB），当无法从PHP配置读取时使用
     'ALLOWED_TYPES' => '无限制', // 允许的文件类型
     'MAX_CONCURRENT' => 3, // 最大并发数
@@ -20,6 +23,419 @@ $CONFIG = array(
 
 // 启用输出缓冲，防止headers already sent错误
 ob_start();
+
+// PHP 5.2兼容的恒定时间字符串比较
+function constantTimeEquals($known, $given)
+{
+    if (!is_string($known) || !is_string($given) || strlen($known) !== strlen($given)) {
+        return false;
+    }
+
+    $result = 0;
+    $length = strlen($known);
+    for ($i = 0; $i < $length; $i++) {
+        $result |= ord($known[$i]) ^ ord($given[$i]);
+    }
+    return $result === 0;
+}
+
+// 从系统安全随机源读取字节；不可用时拒绝降级到伪随机数
+function secureRandomBytesCompat($length)
+{
+    if (function_exists('openssl_random_pseudo_bytes')) {
+        $strong = false;
+        $bytes = openssl_random_pseudo_bytes($length, $strong);
+        if ($bytes !== false && strlen($bytes) === $length && $strong) {
+            return $bytes;
+        }
+    }
+
+    if (function_exists('mcrypt_create_iv') && defined('MCRYPT_DEV_URANDOM')) {
+        $bytes = mcrypt_create_iv($length, MCRYPT_DEV_URANDOM);
+        if ($bytes !== false && strlen($bytes) === $length) {
+            return $bytes;
+        }
+    }
+
+    if (DIRECTORY_SEPARATOR === '/' && is_readable('/dev/urandom')) {
+        $handle = @fopen('/dev/urandom', 'rb');
+        if ($handle) {
+            $bytes = '';
+            while (strlen($bytes) < $length && !feof($handle)) {
+                $bytes .= fread($handle, $length - strlen($bytes));
+            }
+            fclose($handle);
+            if (strlen($bytes) === $length) {
+                return $bytes;
+            }
+        }
+    }
+
+    throw new Exception('服务器不支持安全随机数，无法初始化认证系统');
+}
+
+// Portable phpass实现，兼容PHP 5.2
+function phpassEncode64($input, $count)
+{
+    $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    $output = '';
+    $i = 0;
+    do {
+        $value = ord($input[$i++]);
+        $output .= $itoa64[$value & 0x3f];
+        if ($i < $count) {
+            $value |= ord($input[$i]) << 8;
+        }
+        $output .= $itoa64[($value >> 6) & 0x3f];
+        if ($i++ >= $count) {
+            break;
+        }
+        if ($i < $count) {
+            $value |= ord($input[$i]) << 16;
+        }
+        $output .= $itoa64[($value >> 12) & 0x3f];
+        if ($i++ >= $count) {
+            break;
+        }
+        $output .= $itoa64[($value >> 18) & 0x3f];
+    } while ($i < $count);
+
+    return $output;
+}
+
+function phpassCryptPrivate($password, $setting)
+{
+    $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    if (substr($setting, 0, 3) !== '$P$' && substr($setting, 0, 3) !== '$H$') {
+        return '*';
+    }
+
+    $countLog2 = strpos($itoa64, $setting[3]);
+    if ($countLog2 < 7 || $countLog2 > 30) {
+        return '*';
+    }
+
+    $salt = substr($setting, 4, 8);
+    if (strlen($salt) !== 8) {
+        return '*';
+    }
+
+    $count = 1 << $countLog2;
+    $hash = md5($salt . $password, true);
+    do {
+        $hash = md5($hash . $password, true);
+    } while (--$count);
+
+    return substr($setting, 0, 12) . phpassEncode64($hash, 16);
+}
+
+function hashPasswordCompat($password)
+{
+    $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    $setting = '$P$' . $itoa64[13] . phpassEncode64(secureRandomBytesCompat(6), 6);
+    return phpassCryptPrivate($password, $setting);
+}
+
+function verifyPasswordCompat($password, $storedHash)
+{
+    $calculated = phpassCryptPrivate($password, $storedHash);
+    return constantTimeEquals($storedHash, $calculated);
+}
+
+function getAuthDataPath()
+{
+    global $CONFIG;
+    return dirname(__FILE__) . DIRECTORY_SEPARATOR . $CONFIG['AUTH_DATA_FILE'];
+}
+
+function getAuthLockPath()
+{
+    global $CONFIG;
+    return dirname(__FILE__) . DIRECTORY_SEPARATOR . $CONFIG['AUTH_LOCK_FILE'];
+}
+
+function acquireAuthDataLock()
+{
+    $handle = @fopen(getAuthLockPath(), 'a+b');
+    if (!$handle || !flock($handle, LOCK_EX)) {
+        if ($handle) {
+            fclose($handle);
+        }
+        throw new Exception('无法锁定认证数据文件');
+    }
+
+    if (filesize(getAuthLockPath()) === 0) {
+        fwrite($handle, "<?php exit; ?>\n");
+        fflush($handle);
+        @chmod(getAuthLockPath(), 0600);
+    }
+    return $handle;
+}
+
+function releaseAuthDataLock($handle)
+{
+    flock($handle, LOCK_UN);
+    fclose($handle);
+}
+
+function readAuthDataUnlocked()
+{
+    $path = getAuthDataPath();
+    $content = @file_get_contents($path);
+    $prefix = "<?php exit; ?>\n";
+    if ($content === false || substr($content, 0, strlen($prefix)) !== $prefix) {
+        throw new Exception('认证数据文件不存在或保护头无效');
+    }
+
+    $data = json_decode(substr($content, strlen($prefix)), true);
+    if (!is_array($data) || !isset($data['schema']) || $data['schema'] !== 1 ||
+        !isset($data['data']) || !is_array($data['data']) ||
+        !isset($data['data']['password']) || !is_array($data['data']['password']) ||
+        !isset($data['data']['password']['hash']) ||
+        !isset($data['data']['tokens']) || !is_array($data['data']['tokens'])) {
+        throw new Exception('认证数据文件格式无效');
+    }
+    return $data;
+}
+
+function writeAuthDataUnlocked($data)
+{
+    $path = getAuthDataPath();
+    $json = json_encode($data);
+    if ($json === false) {
+        throw new Exception('认证数据序列化失败');
+    }
+
+    $tempPath = $path . '.tmp.' . bin2hex(secureRandomBytesCompat(8)) . '.php';
+    $content = "<?php exit; ?>\n" . $json;
+    $handle = @fopen($tempPath, 'wb');
+    if (!$handle) {
+        throw new Exception('无法创建认证数据临时文件');
+    }
+
+    $written = fwrite($handle, $content);
+    fflush($handle);
+    fclose($handle);
+    if ($written !== strlen($content)) {
+        @unlink($tempPath);
+        throw new Exception('认证数据写入不完整');
+    }
+    @chmod($tempPath, 0600);
+
+    if (!@rename($tempPath, $path)) {
+        // Windows不能直接替换现有文件，仅用于本地兼容；生产Unix环境走原子rename。
+        if (@file_put_contents($path, $content, LOCK_EX) === false) {
+            @unlink($tempPath);
+            throw new Exception('无法替换认证数据文件');
+        }
+        @unlink($tempPath);
+    }
+    @chmod($path, 0600);
+}
+
+function initializeAuthData()
+{
+    global $CONFIG;
+    $lock = acquireAuthDataLock();
+    try {
+        if (file_exists(getAuthDataPath())) {
+            $data = readAuthDataUnlocked();
+        } else {
+            $data = array(
+                'schema' => 1,
+                'data' => array(
+                    'password' => array(
+                        'hash' => hashPasswordCompat($CONFIG['DEFAULT_PASSWORD']),
+                        'changed_at' => 0,
+                        'force_change' => true
+                    ),
+                    'tokens' => array()
+                )
+            );
+            writeAuthDataUnlocked($data);
+        }
+        releaseAuthDataLock($lock);
+        return $data;
+    } catch (Exception $e) {
+        releaseAuthDataLock($lock);
+        throw $e;
+    }
+}
+
+function pruneAuthTokens(&$tokens)
+{
+    global $CONFIG;
+    $now = time();
+    foreach ($tokens as $id => $record) {
+        if (!is_array($record) || !isset($record['expires_at']) || $record['expires_at'] < $now) {
+            unset($tokens[$id]);
+        }
+    }
+
+    while (count($tokens) >= $CONFIG['MAX_AUTH_TOKENS']) {
+        $oldestId = null;
+        $oldestTime = null;
+        foreach ($tokens as $id => $record) {
+            $createdAt = isset($record['created_at']) ? (int)$record['created_at'] : 0;
+            if ($oldestTime === null || $createdAt < $oldestTime) {
+                $oldestTime = $createdAt;
+                $oldestId = $id;
+            }
+        }
+        if ($oldestId === null) {
+            break;
+        }
+        unset($tokens[$oldestId]);
+    }
+}
+
+function getDeviceLabel()
+{
+    $userAgent = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '未知设备';
+    $userAgent = preg_replace('/[\x00-\x1F\x7F]/', '', $userAgent);
+    return substr($userAgent, 0, 120);
+}
+
+function addAuthTokenUnlocked(&$data)
+{
+    global $CONFIG;
+    pruneAuthTokens($data['data']['tokens']);
+    $selector = bin2hex(secureRandomBytesCompat(16));
+    $validator = bin2hex(secureRandomBytesCompat(32));
+    $tokenId = hash('sha256', $selector);
+    $expires = time() + $CONFIG['AUTH_COOKIE_EXPIRE'];
+    $data['data']['tokens'][$tokenId] = array(
+        'validator_hash' => hash('sha256', $validator),
+        'created_at' => time(),
+        'expires_at' => $expires,
+        'device' => getDeviceLabel()
+    );
+    return array(
+        'cookie' => $selector . '.' . $validator,
+        'id' => $tokenId,
+        'validator' => $validator,
+        'expires_at' => $expires
+    );
+}
+
+function loginAndIssueAuthToken($password)
+{
+    $lock = acquireAuthDataLock();
+    try {
+        $data = readAuthDataUnlocked();
+        if (!verifyPasswordCompat($password, $data['data']['password']['hash'])) {
+            releaseAuthDataLock($lock);
+            return false;
+        }
+        $token = addAuthTokenUnlocked($data);
+        $token['force_change'] = !empty($data['data']['password']['force_change']);
+        writeAuthDataUnlocked($data);
+        releaseAuthDataLock($lock);
+        return $token;
+    } catch (Exception $e) {
+        releaseAuthDataLock($lock);
+        throw $e;
+    }
+}
+
+function parseAndVerifyAuthCookie($data)
+{
+    global $CONFIG;
+    if (!isset($_COOKIE[$CONFIG['AUTH_COOKIE_NAME']])) {
+        return false;
+    }
+
+    $parts = explode('.', $_COOKIE[$CONFIG['AUTH_COOKIE_NAME']], 2);
+    if (count($parts) !== 2 || !preg_match('/^[a-f0-9]{32}$/', $parts[0]) ||
+        !preg_match('/^[a-f0-9]{64}$/', $parts[1])) {
+        return false;
+    }
+
+    $tokenId = hash('sha256', $parts[0]);
+    if (!isset($data['data']['tokens'][$tokenId])) {
+        return false;
+    }
+    $record = $data['data']['tokens'][$tokenId];
+    if (!isset($record['expires_at']) || $record['expires_at'] < time() ||
+        !isset($record['validator_hash']) ||
+        !constantTimeEquals($record['validator_hash'], hash('sha256', $parts[1]))) {
+        return false;
+    }
+
+    return array('id' => $tokenId, 'validator' => $parts[1], 'record' => $record);
+}
+
+function setAuthCookieCompat($value, $expires)
+{
+    global $CONFIG;
+    $secure = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== '' && $_SERVER['HTTPS'] !== 'off';
+    $cookie = $CONFIG['AUTH_COOKIE_NAME'] . '=' . $value . '; Expires=' . gmdate('D, d M Y H:i:s', $expires) . ' GMT; Path=/; HttpOnly; SameSite=Lax';
+    if ($secure) {
+        $cookie .= '; Secure';
+    }
+    header('Set-Cookie: ' . $cookie, false);
+}
+
+function clearAuthCookieCompat()
+{
+    global $CONFIG;
+    setAuthCookieCompat('', time() - 3600);
+    unset($_COOKIE[$CONFIG['AUTH_COOKIE_NAME']]);
+}
+
+function createCsrfToken($validator, $action)
+{
+    return hash_hmac('sha256', '2025-file-manager:' . $action, $validator);
+}
+
+function verifyCsrfToken($auth, $action)
+{
+    return isset($_POST['csrf_token']) && constantTimeEquals(
+        createCsrfToken($auth['validator'], $action),
+        $_POST['csrf_token']
+    );
+}
+
+function revokeAuthToken($tokenId)
+{
+    $lock = acquireAuthDataLock();
+    try {
+        $data = readAuthDataUnlocked();
+        if (isset($data['data']['tokens'][$tokenId])) {
+            unset($data['data']['tokens'][$tokenId]);
+            writeAuthDataUnlocked($data);
+        }
+        releaseAuthDataLock($lock);
+    } catch (Exception $e) {
+        releaseAuthDataLock($lock);
+        throw $e;
+    }
+}
+
+function changePasswordAndRenewToken($currentPassword, $newPassword)
+{
+    $lock = acquireAuthDataLock();
+    try {
+        $data = readAuthDataUnlocked();
+        if (!verifyPasswordCompat($currentPassword, $data['data']['password']['hash'])) {
+            releaseAuthDataLock($lock);
+            return false;
+        }
+        $data['data']['password'] = array(
+            'hash' => hashPasswordCompat($newPassword),
+            'changed_at' => time(),
+            'force_change' => false
+        );
+        $data['data']['tokens'] = array();
+        $token = addAuthTokenUnlocked($data);
+        writeAuthDataUnlocked($data);
+        releaseAuthDataLock($lock);
+        return $token;
+    } catch (Exception $e) {
+        releaseAuthDataLock($lock);
+        throw $e;
+    }
+}
 
 // 辅助函数：将 php.ini 中的大小字符串转换为字节数
 function convertToBytes($value)
@@ -229,9 +645,23 @@ function isTextFile($fileName)
     return isset($textExtensions[$extension]);
 }
 
+// 运行时认证文件不能通过文件管理器访问或覆盖
+function isProtectedRuntimePath($path)
+{
+    global $CONFIG;
+    $normalized = str_replace('\\', '/', $path);
+    $name = mb_basename($normalized);
+    return $name === $CONFIG['AUTH_DATA_FILE'] ||
+        $name === $CONFIG['AUTH_LOCK_FILE'] ||
+        strpos($name, $CONFIG['AUTH_DATA_FILE'] . '.tmp.') === 0;
+}
+
 // 辅助函数 - 验证路径安全性
 function validatePath($path, $basePath)
 {
+    if (isProtectedRuntimePath($path)) {
+        return false;
+    }
     // 简化路径验证逻辑，使用realpath和strpos双重检查
     $realPath = @realpath($path);
     $realBasePath = @realpath($basePath);
@@ -358,107 +788,129 @@ if (isset($_GET['error'])) {
     $error = urldecode($_GET['error']);
 }
 
-// 处理密码验证
-if (isset($_POST['password_submit'])) {
-    $enteredPassword = stripslashes($_POST['password']);
-    if ($enteredPassword === $CONFIG['ACCESS_PASSWORD']) {
-        // 登录成功，设置认证cookie
-        $authToken = md5(uniqid(rand(), true));
-        setcookie($CONFIG['AUTH_COOKIE_NAME'], $authToken, time() + $CONFIG['AUTH_COOKIE_EXPIRE'], '/');
-        // 使用PRG模式，防止刷新页面重新提交
-        header('Location: ' . $currentFile . '?success=' . urlencode('登录成功！'));
-        exit();
-    } else {
-        // 密码错误
-        header('Location: ' . $currentFile . '?error=' . urlencode('密码错误，请重试。'));
-        exit();
-    }
-}
-
-// 处理登出
-if (isset($_GET['logout'])) {
-    // 删除认证cookie
-    setcookie($CONFIG['AUTH_COOKIE_NAME'], '', time() - 3600, '/');
-    header('Location: ' . $currentFile . '?success=' . urlencode('已成功退出登录！'));
+try {
+    $authData = initializeAuthData();
+} catch (Exception $e) {
+    header('HTTP/1.1 500 Internal Server Error');
+    echo '<!DOCTYPE html><html lang="zh-CN"><meta charset="UTF-8"><title>认证初始化失败</title>';
+    echo '<body><h1>认证初始化失败</h1><p>' . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8') . '</p></body></html>';
     exit();
 }
 
-// 处理密码修改
-if (isset($_POST['change_password'])) {
-    $currentPassword = stripslashes($_POST['current_password']);
-    $newPassword = stripslashes($_POST['new_password']);
-    $confirmPassword = stripslashes($_POST['confirm_password']);
+$currentAuth = parseAndVerifyAuthCookie($authData);
+$isAuthenticated = $currentAuth !== false;
+$requiresPasswordChange = !empty($authData['data']['password']['force_change']);
 
-    // 验证当前密码
-    if ($currentPassword !== $CONFIG['ACCESS_PASSWORD']) {
-        $errorUrl = $currentFile . '?error=' . urlencode('当前密码错误，请重试。');
-        if (isset($_GET['path'])) {
-            $errorUrl = $currentFile . '?path=' . urlencode($_GET['path']) . '&error=' . urlencode('当前密码错误，请重试。');
+// 处理密码验证
+if (isset($_POST['password_submit'])) {
+    $enteredPassword = isset($_POST['password']) ? stripslashes($_POST['password']) : '';
+    try {
+        $authToken = loginAndIssueAuthToken($enteredPassword);
+        if ($authToken !== false) {
+            setAuthCookieCompat($authToken['cookie'], $authToken['expires_at']);
+            $message = $authToken['force_change'] ? '登录成功，请立即修改默认密码。' : '登录成功！';
+            header('Location: ' . $currentFile . '?success=' . urlencode($message));
+            exit();
         }
-        header('Location: ' . $errorUrl);
+    } catch (Exception $e) {
+        header('Location: ' . $currentFile . '?error=' . urlencode($e->getMessage()));
         exit();
     }
+    header('Location: ' . $currentFile . '?error=' . urlencode('密码错误，请重试。'));
+    exit();
+}
 
-    // 验证新密码长度
-    if (strlen($newPassword) < 6) {
-        $errorUrl = $currentFile . '?error=' . urlencode('新密码长度不能少于6个字符。');
-        if (isset($_GET['path'])) {
-            $errorUrl = $currentFile . '?path=' . urlencode($_GET['path']) . '&error=' . urlencode('新密码长度不能少于6个字符。');
-        }
-        header('Location: ' . $errorUrl);
+// 注销当前Token
+if (isset($_POST['logout'])) {
+    if (!$isAuthenticated || !verifyCsrfToken($currentAuth, 'logout')) {
+        header('Location: ' . $currentFile . '?error=' . urlencode('无效的退出请求'));
         exit();
     }
-
-    // 验证两次输入的新密码是否一致
-    if ($newPassword !== $confirmPassword) {
-        $errorUrl = $currentFile . '?error=' . urlencode('两次输入的新密码不一致，请重试。');
-        if (isset($_GET['path'])) {
-            $errorUrl = $currentFile . '?path=' . urlencode($_GET['path']) . '&error=' . urlencode('两次输入的新密码不一致，请重试。');
-        }
-        header('Location: ' . $errorUrl);
+    try {
+        revokeAuthToken($currentAuth['id']);
+        clearAuthCookieCompat();
+        header('Location: ' . $currentFile . '?success=' . urlencode('已成功退出登录！'));
         exit();
-    }
-
-    // 读取当前脚本内容
-    $scriptContent = file_get_contents(__FILE__);
-
-    // 使用正则表达式替换密码
-    $oldPasswordPattern = '/\'ACCESS_PASSWORD\'\s*=>\s*\'[^\']+\'/';
-    $newPasswordLine = "'ACCESS_PASSWORD' => '{$newPassword}'";
-    $newScriptContent = preg_replace($oldPasswordPattern, $newPasswordLine, $scriptContent);
-
-    // 写入修改后的脚本内容
-    if (file_put_contents(__FILE__, $newScriptContent)) {
-        // 修改成功，更新当前会话中的密码
-        $CONFIG['ACCESS_PASSWORD'] = $newPassword;
-
-        // 重新设置认证cookie
-        $authToken = md5(uniqid(rand(), true));
-        setcookie($CONFIG['AUTH_COOKIE_NAME'], $authToken, time() + $CONFIG['AUTH_COOKIE_EXPIRE'], '/');
-
-        // 构建正确的重定向URL
-        $redirectUrl = $currentFile . '?success=' . urlencode('密码修改成功！请使用新密码登录。');
-        if (isset($_GET['path'])) {
-            $redirectUrl = $currentFile . '?path=' . urlencode($_GET['path']) . '&success=' . urlencode('密码修改成功！请使用新密码登录。');
-        }
-        header('Location: ' . $redirectUrl);
-        exit();
-    } else {
-        // 构建正确的重定向URL
-        $errorRedirectUrl = $currentFile . '?error=' . urlencode('密码修改失败，请检查服务器写入权限。');
-        if (isset($_GET['path'])) {
-            $errorRedirectUrl = $currentFile . '?path=' . urlencode($_GET['path']) . '&error=' . urlencode('密码修改失败，请检查服务器写入权限。');
-        }
-        header('Location: ' . $errorRedirectUrl);
+    } catch (Exception $e) {
+        header('Location: ' . $currentFile . '?error=' . urlencode($e->getMessage()));
         exit();
     }
 }
 
-// 检查用户是否已认证
-$isAuthenticated = isset($_COOKIE[$CONFIG['AUTH_COOKIE_NAME']]);
+// 撤销其他登录设备
+if (isset($_POST['revoke_token'])) {
+    $tokenId = isset($_POST['token_id']) ? $_POST['token_id'] : '';
+    if (!$isAuthenticated || !verifyCsrfToken($currentAuth, 'revoke_token') ||
+        !preg_match('/^[a-f0-9]{64}$/', $tokenId) || $tokenId === $currentAuth['id']) {
+        header('Location: ' . $currentFile . '?error=' . urlencode('无效的Token撤销请求'));
+        exit();
+    }
+    try {
+        revokeAuthToken($tokenId);
+        header('Location: ' . $currentFile . '?success=' . urlencode('登录设备已撤销'));
+        exit();
+    } catch (Exception $e) {
+        header('Location: ' . $currentFile . '?error=' . urlencode($e->getMessage()));
+        exit();
+    }
+}
+
+// 修改密码后撤销所有Token，并为当前设备签发新Token
+if (isset($_POST['change_password'])) {
+    $currentPassword = isset($_POST['current_password']) ? stripslashes($_POST['current_password']) : '';
+    $newPassword = isset($_POST['new_password']) ? stripslashes($_POST['new_password']) : '';
+    $confirmPassword = isset($_POST['confirm_password']) ? stripslashes($_POST['confirm_password']) : '';
+    $redirectBase = $currentFile;
+    if (isset($_GET['path'])) {
+        $redirectBase .= '?path=' . urlencode($_GET['path']) . '&';
+    } else {
+        $redirectBase .= '?';
+    }
+
+    if (!$isAuthenticated || !verifyCsrfToken($currentAuth, 'change_password')) {
+        header('Location: ' . $redirectBase . 'error=' . urlencode('无效的密码修改请求'));
+        exit();
+    }
+    if (strlen($newPassword) < 6) {
+        header('Location: ' . $redirectBase . 'error=' . urlencode('新密码长度不能少于6个字符。'));
+        exit();
+    }
+    if ($newPassword !== $confirmPassword) {
+        header('Location: ' . $redirectBase . 'error=' . urlencode('两次输入的新密码不一致，请重试。'));
+        exit();
+    }
+
+    try {
+        $authToken = changePasswordAndRenewToken($currentPassword, $newPassword);
+        if ($authToken === false) {
+            header('Location: ' . $redirectBase . 'error=' . urlencode('当前密码错误，请重试。'));
+            exit();
+        }
+        setAuthCookieCompat($authToken['cookie'], $authToken['expires_at']);
+        header('Location: ' . $redirectBase . 'success=' . urlencode('密码修改成功，其他设备已退出登录。'));
+        exit();
+    } catch (Exception $e) {
+        header('Location: ' . $redirectBase . 'error=' . urlencode($e->getMessage()));
+        exit();
+    }
+}
+
+$csrfChangePassword = $isAuthenticated ? createCsrfToken($currentAuth['validator'], 'change_password') : '';
+$csrfLogout = $isAuthenticated ? createCsrfToken($currentAuth['validator'], 'logout') : '';
+$csrfRevokeToken = $isAuthenticated ? createCsrfToken($currentAuth['validator'], 'revoke_token') : '';
+$activeAuthTokens = array();
+if ($isAuthenticated) {
+    foreach ($authData['data']['tokens'] as $tokenId => $record) {
+        if (isset($record['expires_at']) && $record['expires_at'] >= time()) {
+            $record['id'] = $tokenId;
+            $record['is_current'] = $tokenId === $currentAuth['id'];
+            $activeAuthTokens[] = $record;
+        }
+    }
+}
 
 // 如果用户已通过验证，则加载文件上传和文件列表功能
-if ($isAuthenticated) {
+if ($isAuthenticated && !$requiresPasswordChange) {
     $basePath = dirname(__FILE__);
 
     // 处理获取文件夹列表的请求
@@ -590,6 +1042,13 @@ if ($isAuthenticated) {
         // 构建目标文件路径
         $targetDir = $basePath . ($currentPath ? '/' . $currentPath : '');
         $targetFile = $targetDir . '/' . $meta['file_name'];
+
+        if (isProtectedRuntimePath($targetFile)) {
+            @unlink($lockFile);
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '不允许覆盖认证数据文件'));
+            exit();
+        }
 
         // 检查文件是否已存在
         if (file_exists($targetFile)) {
@@ -1137,6 +1596,10 @@ if ($isAuthenticated) {
 
             // 写入文件
             $filePath = $extractDir . '/' . $fileName;
+            if (isProtectedRuntimePath($filePath)) {
+                fclose($tar);
+                return false;
+            }
             $fileDir = dirname($filePath);
             if (!file_exists($fileDir)) {
                 mkdir($fileDir, 0755, true);
@@ -1353,6 +1816,11 @@ if ($isAuthenticated) {
         // 构建完整的文件夹路径
         $folderPath = $basePath . '/' . ($currentPath ? $currentPath . '/' : '') . $folderName;
 
+        if (isProtectedRuntimePath($folderPath)) {
+            header('Location: ' . $currentFile . '?error=' . urlencode('不允许创建认证数据路径'));
+            exit();
+        }
+
         // 检查文件夹是否已存在
         if (file_exists($folderPath)) {
             if ($currentPath) {
@@ -1397,6 +1865,11 @@ if ($isAuthenticated) {
 
         // 构建完整的文件路径
         $filePath = $basePath . '/' . ($currentPath ? $currentPath . '/' : '') . $fileName;
+
+        if (isProtectedRuntimePath($filePath)) {
+            header('Location: ' . $currentFile . '?error=' . urlencode('不允许创建认证数据文件'));
+            exit();
+        }
 
         // 检查文件是否已存在
         if (file_exists($filePath)) {
@@ -1712,6 +2185,11 @@ if ($isAuthenticated) {
 
                     $targetFile = $targetDir . $fileName;
 
+                    if (isProtectedRuntimePath($targetFile)) {
+                        $failedCount++;
+                        continue;
+                    }
+
                     // 如果文件已存在，添加时间戳以避免覆盖
                     if (file_exists($targetFile)) {
                         $filenameWithoutExt = pathinfo($fileName, PATHINFO_FILENAME);
@@ -1763,6 +2241,11 @@ if ($isAuthenticated) {
 
             $targetFile = $targetDir . $fileName;
 
+            if (isProtectedRuntimePath($targetFile)) {
+                echo json_encode(array('success' => false, 'error' => '不允许覆盖认证数据文件'));
+                exit();
+            }
+
             // 移动上传的文件
             if (move_uploaded_file($fileTmpName, $targetFile)) {
                 echo json_encode(array('success' => true, 'file' => $relativePath));
@@ -1798,7 +2281,7 @@ if ($isAuthenticated) {
         // 获取文件夹列表
         if ($handle = opendir($currentPath)) {
             while (false !== ($entry = readdir($handle))) {
-                if ($entry != '.' && $entry != '..' && $entry != basename(__FILE__)) {
+                if ($entry != '.' && $entry != '..' && $entry != basename(__FILE__) && !isProtectedRuntimePath($entry)) {
                     // 移除mb_convert_encoding调用
                     $fullPath = $currentPath . '/' . $entry;
                     $relativePath = empty($path) ? $entry : $path . '/' . $entry;
@@ -2235,14 +2718,14 @@ if ($isAuthenticated) {
         <h1><i class="fas fa-cloud-upload-alt mr-2"></i>文件管理器</h1>
 
         <?php if ($error): ?>
-            <div class="error notice-box"><i class="fas fa-exclamation-circle mr-2"></i><?php echo $error; ?></div>
+            <div class="error notice-box"><i class="fas fa-exclamation-circle mr-2"></i><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></div>
         <?php endif; ?>
 
         <?php if ($success): ?>
-            <div class="success notice-box"><i class="fas fa-check-circle mr-2"></i><?php echo $success; ?></div>
+            <div class="success notice-box"><i class="fas fa-check-circle mr-2"></i><?php echo htmlspecialchars($success, ENT_QUOTES, 'UTF-8'); ?></div>
         <?php endif; ?>
 
-        <?php if ($isAuthenticated): ?>
+        <?php if ($isAuthenticated && !$requiresPasswordChange): ?>
             <!-- 已登录用户可以看到的内容 -->
             <div class="logout">
                 <a href="#" onclick="openAdminModal()"><i class="fas fa-user mr-1"></i>管理员信息</a>
@@ -2265,6 +2748,7 @@ if ($isAuthenticated) {
                         <div class="upload-form">
                             <h3 style="color: #e0e0e0; margin-top: 0; margin-bottom: 20px;">修改密码</h3>
                             <form method="post" action="<?php echo $currentFile; ?><?php echo isset($_GET['path']) ? '?path=' . urlencode($_GET['path']) : ''; ?>">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfChangePassword, ENT_QUOTES, 'UTF-8'); ?>">
                                 <div class="form-group" style="display: flex; flex-direction: column; gap: 15px;">
                                     <div style="flex: 1; min-width: 200px;">
                                         <label for="current_password" class="inline-label"><i class="fas fa-key mr-1"></i>当前密码</label>
@@ -2288,9 +2772,26 @@ if ($isAuthenticated) {
 
                         <!-- 退出登录按钮 -->
                         <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
-                            <a href="<?php echo $currentFile; ?>?logout=true" onclick="return confirm('确定要退出登录吗？');" style="background-color: #ff6b6b; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center;">
-                                <i class="fas fa-sign-out-alt mr-1"></i>退出登录
-                            </a>
+                            <form method="post" style="display: inline-flex;">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfLogout, ENT_QUOTES, 'UTF-8'); ?>">
+                                <button type="submit" name="logout" class="inline-button" style="background-color: #ff6b6b;"><i class="fas fa-sign-out-alt mr-1"></i>退出登录</button>
+                            </form>
+                        </div>
+
+                        <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
+                            <h3 style="color: #e0e0e0; margin-top: 0;">登录设备</h3>
+                            <?php foreach ($activeAuthTokens as $authTokenRecord): ?>
+                                <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 8px 0;">
+                                    <span><?php echo htmlspecialchars($authTokenRecord['device'], ENT_QUOTES, 'UTF-8'); ?> · <?php echo date('Y-m-d H:i', $authTokenRecord['created_at']); ?><?php if ($authTokenRecord['is_current']): ?>（当前设备）<?php endif; ?></span>
+                                    <?php if (!$authTokenRecord['is_current']): ?>
+                                        <form method="post" style="display: inline;">
+                                            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfRevokeToken, ENT_QUOTES, 'UTF-8'); ?>">
+                                            <input type="hidden" name="token_id" value="<?php echo htmlspecialchars($authTokenRecord['id'], ENT_QUOTES, 'UTF-8'); ?>">
+                                            <button type="submit" name="revoke_token" class="inline-button" style="background-color: #f59e0b; padding: 4px 8px;">撤销</button>
+                                        </form>
+                                    <?php endif; ?>
+                                </div>
+                            <?php endforeach; ?>
                         </div>
                     </div>
                 </div>
@@ -2459,6 +2960,18 @@ if ($isAuthenticated) {
             <?php else: ?>
                 <p>当前目录为空</p>
             <?php endif; ?>
+        <?php elseif ($isAuthenticated && $requiresPasswordChange): ?>
+            <div class="password-form">
+                <h2><i class="fas fa-lock mr-2"></i>首次使用，请修改默认密码</h2>
+                <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfChangePassword, ENT_QUOTES, 'UTF-8'); ?>">
+                    <div class="form-group"><label for="current_password_first">当前密码</label><input type="password" id="current_password_first" name="current_password" required></div>
+                    <div class="form-group"><label for="new_password_first">新密码</label><input type="password" id="new_password_first" name="new_password" required></div>
+                    <div class="form-group"><label for="confirm_password_first">确认新密码</label><input type="password" id="confirm_password_first" name="confirm_password" required></div>
+                    <button type="submit" name="change_password"><i class="fas fa-save mr-1"></i>保存密码</button>
+                </form>
+                <form method="post" style="margin-top: 12px;"><input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfLogout, ENT_QUOTES, 'UTF-8'); ?>"><button type="submit" name="logout" style="background-color: #666;"><i class="fas fa-sign-out-alt mr-1"></i>退出登录</button></form>
+            </div>
         <?php else:
             // 未登录用户看到的密码表单 
         ?>
