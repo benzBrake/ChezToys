@@ -675,6 +675,59 @@ function validatePath($path, $basePath)
     return strpos($path, $basePath) === 0;
 }
 
+// 分片上传会话只允许作为单个目录名使用，禁止路径分隔符和特殊目录名
+function isValidChunkFileId($fileId)
+{
+    return is_string($fileId) && preg_match('/\A[A-Za-z0-9_-]{1,128}\z/D', $fileId) === 1;
+}
+
+// 上传文件名必须是单个文件名，不能通过元数据携带相对路径
+function isValidUploadFileName($fileName)
+{
+    return is_string($fileName) && $fileName !== '' && $fileName !== '.' && $fileName !== '..' &&
+        strpos($fileName, "\0") === false && strpos($fileName, '/') === false && strpos($fileName, '\\') === false;
+}
+
+// 返回安全的相对目录；非法路径返回false。空字符串表示根目录。
+function normalizeUploadTargetPath($path)
+{
+    if (!is_string($path) || strpos($path, "\0") !== false || strpos($path, '\\') !== false ||
+        ($path !== '' && substr($path, 0, 1) === '/')) {
+        return false;
+    }
+
+    $sanitized = sanitizePath($path);
+    if ($sanitized === null || $sanitized !== $path) {
+        return false;
+    }
+
+    if ($path === '') {
+        return '';
+    }
+
+    $segments = explode('/', $path);
+    foreach ($segments as $segment) {
+        if ($segment === '' || $segment === '.' || $segment === '..') {
+            return false;
+        }
+    }
+    return implode('/', $segments);
+}
+
+// 仅用于已经存在的目录，使用真实路径阻止目录穿越和符号链接逃逸
+function isExistingDirectoryWithinBase($path, $basePath)
+{
+    $realPath = @realpath($path);
+    $realBasePath = @realpath($basePath);
+    if ($realPath === false || $realBasePath === false || !is_dir($realPath)) {
+        return false;
+    }
+
+    $realPath = rtrim(str_replace('\\', '/', $realPath), '/');
+    $realBasePath = rtrim(str_replace('\\', '/', $realBasePath), '/');
+    return $realPath === $realBasePath || strpos($realPath, $realBasePath . '/') === 0;
+}
+
 // 辅助函数 - 递归删除文件夹
 function deleteDirectory($dir)
 {
@@ -924,11 +977,19 @@ if ($isAuthenticated && !$requiresPasswordChange) {
 
     // 处理分片上传
     if (isset($_POST['chunk_upload'])) {
-        $fileId = stripslashes($_POST['file_id']);
+        $fileIdInput = isset($_POST['file_id']) ? $_POST['file_id'] : '';
+        $fileId = is_string($fileIdInput) ? stripslashes($fileIdInput) : '';
         $chunkIndex = intval($_POST['chunk_index']);
         $totalChunks = intval($_POST['total_chunks']);
-        $fileName = sanitizePath(stripslashes($_POST['file_name']), true);
+        $fileNameInput = isset($_POST['file_name']) ? $_POST['file_name'] : '';
+        $fileName = is_string($fileNameInput) ? sanitizePath(stripslashes($fileNameInput), true) : '';
         $fileSize = intval($_POST['file_size']);
+
+        if (!isValidChunkFileId($fileId) || !isValidUploadFileName($fileName)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '上传标识或文件名不合法'));
+            exit();
+        }
 
         // 验证文件大小不超过最大限制
         if ($fileSize > $CONFIG['MAX_UPLOAD_SIZE']) {
@@ -970,7 +1031,21 @@ if ($isAuthenticated && !$requiresPasswordChange) {
         }
 
         // 创建临时目录
-        $chunkDir = $basePath . '/' . $CONFIG['CHUNK_DIR'] . '/' . $fileId;
+        $chunkRoot = $basePath . '/' . $CONFIG['CHUNK_DIR'];
+        if (!file_exists($chunkRoot)) {
+            @mkdir($chunkRoot, 0755, true);
+        }
+        if (!isExistingDirectoryWithinBase($chunkRoot, $basePath)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '分片目录不安全'));
+            exit();
+        }
+        $chunkDir = $chunkRoot . '/' . $fileId;
+        if (file_exists($chunkDir) && !isExistingDirectoryWithinBase($chunkDir, $basePath)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '分片目录不安全'));
+            exit();
+        }
         if (!file_exists($chunkDir)) {
             mkdir($chunkDir, 0755, true);
         }
@@ -996,12 +1071,18 @@ if ($isAuthenticated && !$requiresPasswordChange) {
 
     // 处理分片合并
     if (isset($_POST['chunk_merge'])) {
-        $fileId = stripslashes($_POST['file_id']);
+        $fileIdInput = isset($_POST['file_id']) ? $_POST['file_id'] : '';
+        $fileId = is_string($fileIdInput) ? stripslashes($fileIdInput) : '';
+        if (!isValidChunkFileId($fileId)) {
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '上传标识不合法'));
+            exit();
+        }
         $chunkDir = $basePath . '/' . $CONFIG['CHUNK_DIR'] . '/' . $fileId;
         $lockFile = $chunkDir . '/.merging.lock';
 
         // 检查分片目录是否存在
-        if (!file_exists($chunkDir) || !is_dir($chunkDir)) {
+        if (!file_exists($chunkDir) || !is_dir($chunkDir) || !isExistingDirectoryWithinBase($chunkDir, $basePath)) {
             header('Content-Type: application/json');
             echo json_encode(array('success' => false, 'error' => '分片目录不存在或已被合并'));
             exit();
@@ -1037,11 +1118,32 @@ if ($isAuthenticated && !$requiresPasswordChange) {
         }
 
         $meta = json_decode(file_get_contents($metaFile), true);
-        $currentPath = isset($_POST['current_path']) ? stripslashes($_POST['current_path']) : '';
+        $currentPathInput = isset($_POST['current_path']) ? $_POST['current_path'] : '';
+        $currentPathRaw = is_string($currentPathInput) ? stripslashes($currentPathInput) : '';
+        if (!is_string($currentPathInput) && $currentPathInput !== '') {
+            $currentPathRaw = false;
+        }
+        $currentPath = normalizeUploadTargetPath($currentPathRaw);
+
+        if (!is_array($meta) || !isset($meta['file_name']) || !isValidUploadFileName($meta['file_name']) ||
+            !isset($meta['total_chunks']) || intval($meta['total_chunks']) < 1 || $currentPath === false) {
+            @unlink($lockFile);
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '上传元数据或目标路径不合法'));
+            exit();
+        }
+        $meta['total_chunks'] = intval($meta['total_chunks']);
 
         // 构建目标文件路径
         $targetDir = $basePath . ($currentPath ? '/' . $currentPath : '');
         $targetFile = $targetDir . '/' . $meta['file_name'];
+
+        if (!isExistingDirectoryWithinBase($targetDir, $basePath)) {
+            @unlink($lockFile);
+            header('Content-Type: application/json');
+            echo json_encode(array('success' => false, 'error' => '目标目录不存在或不安全'));
+            exit();
+        }
 
         if (isProtectedRuntimePath($targetFile)) {
             @unlink($lockFile);
@@ -1051,7 +1153,7 @@ if ($isAuthenticated && !$requiresPasswordChange) {
         }
 
         // 检查文件是否已存在
-        if (file_exists($targetFile)) {
+        if (file_exists($targetFile) || is_link($targetFile)) {
             $filenameWithoutExt = pathinfo($meta['file_name'], PATHINFO_FILENAME);
             $fileExt = pathinfo($meta['file_name'], PATHINFO_EXTENSION);
             $meta['file_name'] = $filenameWithoutExt . '_' . time() . '.' . $fileExt;
